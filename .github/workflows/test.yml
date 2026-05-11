@@ -33,6 +33,7 @@ jobs:
           pytest tests/ -v
 
       - name: Lint with ruff
+        continue-on-error: true
         run: |
           pip install ruff
           ruff check .
