@@ -1,0 +1,11 @@
+name: hermes-mneme
+version: 0.2.0
+description: "Retrieval-based context engine for Hermes — execution-graph-aware memory replacement for the default compressor."
+author: "Hermes-Mneme Contributors"
+license: "Apache-2.0"
+homepage: "https://github.com/johnnykor82/hermes-mneme"
+provides_tools:
+  - context_search
+  - fetch_event
+  - expand_context
+  - get_execution_state

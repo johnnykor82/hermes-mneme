@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mneme"
+version = "0.2.0"
+description = "Retrieval-based context engine plugin for Hermes — execution-graph-aware memory replacement for the default compressor."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "johnnykor82", email = "johnnykor@gmail.com"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "sqlite-vec>=0.1.0",
+    "tiktoken>=0.5.0",
+    "numpy>=1.24.0",
+    "requests>=2.28.0",
+    "pyyaml>=6.0"
+]
+
+[project.optional-dependencies]
+huggingface = ["transformers>=4.30.0", "torch>=2.0.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "ruff>=0.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/johnnykor82/hermes-mneme"
+Repository = "https://github.com/johnnykor82/hermes-mneme"
+"Bug Tracker" = "https://github.com/johnnykor82/hermes-mneme/issues"
+
+[tool.setuptools]
+# Flat layout — all .py files live at the package root, plugin is discovered
+# by Hermes via the directory location and `register(ctx)` entry-point.
+py-modules = [
+    "engine", "store", "index", "router", "classifier", "parser",
+    "prompt_builder", "compressor", "enrichment", "segmenter",
+    "graph", "observability", "tools", "config",
+]
