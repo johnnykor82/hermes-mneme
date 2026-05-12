@@ -96,85 +96,110 @@ class EmbeddingIndex:
                 self._cb_logged_disabled = True
 
     def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding from Jina API. Skips the HTTP call if the circuit
-        breaker is open (3+ consecutive failures within the last 5 min)."""
-        if not text or not text.strip():
-            return None
-        # A10: circuit breaker — skip HTTP entirely while open.
+        """Single-text embedding (compat shim — internally uses the batch path)."""
+        results = self.get_embeddings_batch([text])
+        return results[0] if results else None
+
+    def get_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """Batch-embed via one Jina POST. Returns same-length list with None for
+        empty/whitespace inputs or when the circuit breaker is open. Jina's
+        OpenAI-compatible API accepts a list in `input`."""
+        n = len(texts)
+        if n == 0:
+            return []
+        idx_to_pos: List[int] = []
+        clean: List[str] = []
+        for i, t in enumerate(texts):
+            if t and t.strip():
+                idx_to_pos.append(i)
+                clean.append(t)
+        out: List[Optional[List[float]]] = [None] * n
+        if not clean:
+            return out
         if self._cb_open_until_ts and time.time() < self._cb_open_until_ts:
-            return None
-        # Cooldown elapsed: half-open. Reset failure counter so a single
-        # successful call closes the breaker, but a fresh failure re-opens it.
+            return out
         if self._cb_open_until_ts and time.time() >= self._cb_open_until_ts:
             logger.info("Embedding circuit breaker entering half-open (cooldown elapsed).")
             self._cb_open_until_ts = 0.0
             self._cb_consecutive_failures = 0
             self._cb_logged_disabled = False
-
         try:
             headers = {
                 "Authorization": f"Bearer {JINA_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
-            payload = {
-                "input": text,
-                "model": JINA_MODEL
-            }
-            response = requests.post(JINA_API_URL, json=payload, headers=headers, timeout=30)
+            payload = {"input": clean, "model": JINA_MODEL}
+            response = requests.post(JINA_API_URL, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
-            data = response.json()
-
-            if "data" in data and len(data["data"]) > 0:
-                embedding = data["data"][0]["embedding"]
-                logger.debug(f"Got embedding of length {len(embedding)} for text: {text[:50]}...")
-                self._circuit_breaker_record_success()
-                return embedding
-            else:
-                logger.error(f"Unexpected Jina response: {data}")
-                self._circuit_breaker_record_failure(RuntimeError("unexpected response shape"))
-                return None
+            items = (response.json() or {}).get("data") or []
+            if len(items) != len(clean):
+                logger.error(f"Jina batch returned {len(items)}/{len(clean)} embeddings")
+                self._circuit_breaker_record_failure(RuntimeError("count mismatch"))
+                return out
+            for pos, item in zip(idx_to_pos, items):
+                out[pos] = item.get("embedding")
+            self._circuit_breaker_record_success()
+            return out
         except Exception as e:
-            logger.error(f"Failed to get embedding from Jina: {e}")
+            logger.error(f"Failed to batch-embed from Jina: {e}")
             self._circuit_breaker_record_failure(e)
-            return None
+            return out
 
     def add_embedding(self, event_id: str, segment_id: str, text_to_embed: str,
                       model_id: str, token_count: int, event_type: str):
-        """Generate embedding and store in DB. Also insert into vec0 if available."""
-        embedding = self.get_embedding(text_to_embed)
-        if not embedding:
-            logger.warning(f"Skipping embedding for event {event_id} due to generation failure.")
-            return
+        """Single-record path. Internally batches one record."""
+        self.add_embeddings_batch([
+            (event_id, segment_id, text_to_embed, model_id, token_count, event_type)
+        ])
 
+    def add_embeddings_batch(self, records: List[tuple]) -> int:
+        """Embed and persist many events in a single Jina request + one DB
+        transaction. Each record is (event_id, segment_id, text, model_id,
+        token_count, type). Returns count of rows successfully stored."""
+        if not records:
+            return 0
+        texts = [r[2] for r in records]
+        embeddings = self.get_embeddings_batch(texts)
         conn = self._get_connection()
+        stored = 0
         try:
-            embedding_bytes = struct.pack(f'{len(embedding)}f', *embedding)
-
-            conn.execute(
-                """INSERT OR REPLACE INTO embedding_index
-                   (event_id, segment_id, embedding, embedding_model_id, token_count, type)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (event_id, segment_id, embedding_bytes, model_id, token_count, event_type)
-            )
-
-            # Insert into vec0 for fast KNN search
-            if self._vec_available:
+            for rec, emb in zip(records, embeddings):
+                event_id, segment_id, _text, model_id, token_count, ev_type = rec
+                if not emb:
+                    continue
                 try:
-                    conn.execute("INSERT OR REPLACE INTO vec_items (embedding) VALUES (?)", (embedding_bytes,))
-                    vec_rowid = conn.execute("SELECT rowid FROM vec_items WHERE rowid = last_insert_rowid()").fetchone()
-                    if vec_rowid:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO vec_items_meta (rowid, event_id, embedding_model_id, segment_id) VALUES (?, ?, ?, ?)",
-                            (vec_rowid[0], event_id, model_id, segment_id)
-                        )
-                except Exception as _vec_err:
-                    logger.warning(f"vec0 insert failed for {event_id}: {_vec_err}")
-
+                    embedding_bytes = struct.pack(f'{len(emb)}f', *emb)
+                    conn.execute(
+                        """INSERT OR REPLACE INTO embedding_index
+                           (event_id, segment_id, embedding, embedding_model_id, token_count, type)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (event_id, segment_id, embedding_bytes, model_id, token_count, ev_type),
+                    )
+                    if self._vec_available:
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO vec_items (embedding) VALUES (?)",
+                                (embedding_bytes,),
+                            )
+                            row = conn.execute(
+                                "SELECT rowid FROM vec_items WHERE rowid = last_insert_rowid()"
+                            ).fetchone()
+                            if row:
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO vec_items_meta (rowid, event_id, embedding_model_id, segment_id) VALUES (?, ?, ?, ?)",
+                                    (row[0], event_id, model_id, segment_id),
+                                )
+                        except Exception as vec_err:
+                            logger.warning(f"vec0 insert failed for {event_id}: {vec_err}")
+                    stored += 1
+                except Exception as inner:
+                    logger.warning(f"Failed to persist embedding for {event_id}: {inner}")
             conn.commit()
         except Exception as e:
-            logger.error(f"Failed to store embedding: {e}")
+            logger.error(f"Failed batch-store: {e}")
         finally:
             conn.close()
+        return stored
 
     def search(self, query_text: str, session_id: str, segment_id: str = None, top_k: Optional[int] = 20) -> List[Dict[str, Any]]:
         """Search for similar embeddings. Uses vec0 KNN if available, else Python cosine.

@@ -70,6 +70,8 @@ from . import graph
 from . import compressor
 from . import enrichment
 
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -180,6 +182,10 @@ class CustomRouterContextEngine(ContextEngine):
         self._consecutive_memory_calls = 0
         self._pending_checkpoint: Optional[str] = None
         self._last_enrichment_turn = -1
+        # Background embedding executor — moves Jina batch HTTP off the
+        # synchronous compress() hot path. Single worker so we don't hammer
+        # the local embedding server with parallel batches.
+        self._embed_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="mneme-embed")
         logger.info(f"CustomRouterContextEngine initialized. DB: {db_path}")
 
         # One-shot phantom-session cleanup (A0): drop legacy `sessions` rows
@@ -766,11 +772,12 @@ class CustomRouterContextEngine(ContextEngine):
             new_messages = messages[self._processed_msg_count:]
             base_idx = self._processed_msg_count
             segment_changed_this_turn = False
+            pending_embeddings: List[tuple] = []
             if new_messages:
                 logger.info(f"Processing {len(new_messages)} new messages")
+                from .index import JINA_MODEL
                 for offset, msg in enumerate(new_messages):
                     msg_idx = base_idx + offset
-                    # Check segment boundary on user messages
                     if msg.get("role") == "user":
                         prev_seg = self.current_segment_id
                         self.current_segment_id = self.segmenter.handle_new_message(
@@ -783,14 +790,9 @@ class CustomRouterContextEngine(ContextEngine):
 
                     events_data = parser.parse_message_to_event(msg, self.session_id, self.current_segment_id)
                     for sub_idx, ev in enumerate(events_data):
-                        # Deterministic event_id: re-ingest of the same logical
-                        # message produces the same id, so INSERT OR IGNORE
-                        # silently dedupes (critical on session resume after
-                        # gateway restart).
                         det_id = self.store.make_event_id(
                             ev["session_id"], msg_idx, ev["role"], ev["content"], sub_idx
                         )
-                        # Step 1: Write to raw event store
                         event_id, inserted = self.store.add_event(
                             session_id=ev["session_id"], segment_id=ev["segment_id"],
                             event_type=ev["type"], role=ev["role"], content=ev["content"],
@@ -798,20 +800,13 @@ class CustomRouterContextEngine(ContextEngine):
                             token_estimate=ev["token_estimate"], event_id=det_id,
                         )
                         if not inserted:
-                            # Already in DB from a prior process — skip state
-                            # mutation, embedding, and graph-edge writes.
-                            # Embedding (INSERT OR REPLACE) and graph edges
-                            # (INSERT OR IGNORE) are individually idempotent,
-                            # but reprocessing wastes CPU + an embedding call.
                             continue
 
-                        # Step 2: Update execution state (deterministic parser)
                         self._update_state_from_event(ev, event_id)
 
-                        # Step 3: Index embedding (can lag, non-blocking)
-                        # Tool outputs over the configured threshold are embedded as
-                        # head+tail summary, not the full text. The full content stays
-                        # in events.content for fetch_event/expand_context.
+                        # Collect embedding work; one batched HTTP call later,
+                        # then ship the persist step to a background thread
+                        # so compress() doesn't wait on Jina.
                         text_for_embedding = ev["content"]
                         if ev["type"] == "tool_output" and text_for_embedding:
                             text_for_embedding = compressor.summarize_for_embedding(
@@ -820,19 +815,35 @@ class CustomRouterContextEngine(ContextEngine):
                                 summary_tokens=self.config.get("tool_output_summary_tokens", 100),
                             )
                         if text_for_embedding and len(text_for_embedding.strip()) > 5:
-                            try:
-                                from .index import JINA_MODEL
-                                self.indexer.add_embedding(
-                                    event_id, ev["segment_id"], text_for_embedding,
-                                    JINA_MODEL, ev["token_estimate"], ev["type"]
-                                )
-                            except Exception as emb_err:
-                                logger.warning(f"Embedding failed for {event_id}: {emb_err}")
+                            pending_embeddings.append((
+                                event_id, ev["segment_id"], text_for_embedding,
+                                JINA_MODEL, ev["token_estimate"], ev["type"],
+                            ))
 
-                        # Record execution graph edges
                         self._record_graph_edges(ev, event_id)
 
                 self._processed_msg_count = len(messages)
+
+            # Submit the whole turn's embedding work as a single background
+            # batch. compress() returns immediately; retrieval on the current
+            # turn still works because protected_tail covers very-recent
+            # events even before they're embedded.
+            if pending_embeddings:
+                batch_size = int(self.config.get("embedding_batch_size", 16) or 16)
+                indexer = self.indexer
+                def _embed_chunks(records: List[tuple], chunk: int):
+                    try:
+                        for i in range(0, len(records), chunk):
+                            indexer.add_embeddings_batch(records[i:i + chunk])
+                    except Exception as e:
+                        logger.warning(f"Background embed batch failed: {e}")
+                try:
+                    self._embed_executor.submit(_embed_chunks, pending_embeddings, batch_size)
+                except Exception as e:
+                    # Executor shut down or rejected — fall back to inline
+                    # batch so we don't lose the work.
+                    logger.warning(f"Embed executor unavailable, doing inline batch: {e}")
+                    _embed_chunks(pending_embeddings, batch_size)
 
             # Optional LLM enrichment (Stage 5.1).
             # Hybrid trigger: every N turns OR on segment boundary.
