@@ -186,6 +186,15 @@ class CustomRouterContextEngine(ContextEngine):
         # synchronous compress() hot path. Single worker so we don't hammer
         # the local embedding server with parallel batches.
         self._embed_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="mneme-embed")
+        # Background enrichment executor — LLM call (~seconds) used to run
+        # inline inside the compress() lock. That blocked the preflight phase
+        # and a user message arriving during it would abort the turn instead
+        # of being appended after compaction. We now submit and merge the
+        # result on a later compress() call.
+        self._enrichment_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="mneme-enrich")
+        self._enrichment_future: Optional[Any] = None
+        self._enrichment_pending_turn: int = -1
+        self._enrichment_pending_session_id: Optional[str] = None
         logger.info(f"CustomRouterContextEngine initialized. DB: {db_path}")
 
         # One-shot phantom-session cleanup (A0): drop legacy `sessions` rows
@@ -342,9 +351,18 @@ class CustomRouterContextEngine(ContextEngine):
     def _maybe_enrich(self, segment_changed: bool) -> None:
         """Hybrid trigger: every N turns OR on segment boundary.
 
+        Two-phase: (1) merge any finished background enrichment future into
+        `_current_state`; (2) if due and no future is in flight, submit a new
+        one to `_enrichment_executor`. The LLM call itself runs off the hot
+        path so a user message arriving mid-turn can't abort an inline
+        request inside the preflight lock.
+
         On failure or disabled flag — silently keeps existing enrichment.
         Never blocks the turn: any exception is logged and swallowed.
         """
+        # Phase 1: collect a previous turn's result if it has landed.
+        self._collect_finished_enrichment()
+
         if not self.config.get("llm_enrichment_enabled", False):
             logger.info("Enricher: disabled in config (llm_enrichment_enabled=False).")
             return
@@ -355,6 +373,11 @@ class CustomRouterContextEngine(ContextEngine):
                 f"Enricher: NOT ready. endpoint={resolved.get('endpoint')!r} "
                 f"model={resolved.get('model')!r} hermes_llm_keys={list(self._hermes_llm.keys())}"
             )
+            return
+
+        # Don't pile up requests if a previous bg run hasn't finished yet.
+        if self._enrichment_future is not None and not self._enrichment_future.done():
+            logger.info("Enricher: skip — previous background request still in flight.")
             return
 
         every_n = int(self.config.get("enricher_every_n_turns", 5) or 5)
@@ -373,7 +396,7 @@ class CustomRouterContextEngine(ContextEngine):
             )
             return
         logger.info(
-            f"Enricher: TRIGGERING — endpoint={resolved.get('endpoint')!r} "
+            f"Enricher: SUBMITTING (bg) — endpoint={resolved.get('endpoint')!r} "
             f"model={resolved.get('model')!r} turn={turn} "
             f"trigger={'boundary' if boundary_trigger else f'every_{every_n}'}"
         )
@@ -385,23 +408,72 @@ class CustomRouterContextEngine(ContextEngine):
             logger.warning(f"Enricher: failed to load recent events: {e}")
             return
 
-        try:
-            result = self.enricher.enrich(recent)
-        except Exception as e:
-            logger.warning(f"Enricher: enrich() raised: {e}")
-            return
+        enricher = self.enricher
 
+        def _bg_enrich():
+            try:
+                return enricher.enrich(recent)
+            except Exception as e:
+                logger.warning(f"Enricher: bg enrich() raised: {e}")
+                return None
+
+        try:
+            self._enrichment_future = self._enrichment_executor.submit(_bg_enrich)
+            self._enrichment_pending_turn = turn
+            self._enrichment_pending_session_id = self.session_id
+        except Exception as e:
+            # Executor shut down — fall back to inline so we don't silently
+            # drop the trigger window. Same semantics as the embed executor
+            # fallback right above. This is the only path where enrich()
+            # blocks the turn, and only when the bg pool is unavailable.
+            logger.warning(f"Enricher: bg submit failed, running inline: {e}")
+            try:
+                result = enricher.enrich(recent)
+            except Exception as ex:
+                logger.warning(f"Enricher: inline enrich() raised: {ex}")
+                return
+            self._apply_enrichment_result(result, turn, self.session_id)
+
+    def _collect_finished_enrichment(self) -> None:
+        """If the previously submitted enrichment future has finished, merge
+        its result into `_current_state` and persist. Called at the top of
+        `_maybe_enrich` on every turn. No-op if there is no pending future
+        or it isn't done yet."""
+        fut = self._enrichment_future
+        if fut is None or not fut.done():
+            return
+        # Clear the slot up front so a later submit isn't blocked by a stale
+        # finished future if the merge itself raises.
+        self._enrichment_future = None
+        pending_turn = self._enrichment_pending_turn
+        pending_sid = self._enrichment_pending_session_id
+        self._enrichment_pending_turn = -1
+        self._enrichment_pending_session_id = None
+        try:
+            result = fut.result()
+        except Exception as e:
+            logger.warning(f"Enricher: bg future raised on result(): {e}")
+            return
+        self._apply_enrichment_result(result, pending_turn, pending_sid)
+
+    def _apply_enrichment_result(self, result, turn: int, submit_sid: Optional[str]) -> None:
+        """Merge an EnrichmentResult into _current_state and persist.
+        Drops results whose session_id no longer matches the active binding
+        (covers /new or drift between submit and completion)."""
         if result is None:
             return
-
-        # Merge into _current_state.enrichment without nuking unrelated fields.
+        if submit_sid and submit_sid != self.session_id:
+            logger.info(
+                f"Enricher: dropping result from stale session "
+                f"{submit_sid!r} (current={self.session_id!r})"
+            )
+            return
         enrichment_block = self._current_state.get("enrichment") or {}
         if result.intent_label:
             enrichment_block["intent_label"] = result.intent_label
         if result.topic_tags:
             enrichment_block["topic_tags"] = result.topic_tags
         if result.decisions:
-            # Keep last 5 decisions in decision_stack (FIFO).
             stack = self._current_state.get("decision_stack") or []
             for d in result.decisions:
                 if d not in stack:
@@ -409,12 +481,33 @@ class CustomRouterContextEngine(ContextEngine):
             self._current_state["decision_stack"] = stack[-5:]
             enrichment_block["decision_summary"] = result.decisions[-1].get("decision")
         self._current_state["enrichment"] = enrichment_block
-        self._last_enrichment_turn = turn
+        if turn >= 0:
+            self._last_enrichment_turn = turn
+        try:
+            if self.session_id:
+                self.store.commit_state(self.session_id, self._current_state)
+        except Exception as e:
+            logger.warning(f"Enricher: commit_state after merge failed: {e}")
         logger.info(
-            f"Enricher: state updated (intent={bool(result.intent_label)}, "
-            f"tags={len(result.topic_tags)}, decisions={len(result.decisions)}, "
-            f"trigger={'boundary' if boundary_trigger else f'every_{every_n}'})"
+            f"Enricher: state updated from bg result "
+            f"(intent={bool(result.intent_label)}, tags={len(result.topic_tags)}, "
+            f"decisions={len(result.decisions)}, turn={turn})"
         )
+
+    def _drop_pending_enrichment(self, reason: str) -> None:
+        """Cancel/forget any in-flight enrichment future at a session boundary
+        so its result can't be merged into a different session's state."""
+        fut = self._enrichment_future
+        if fut is None:
+            return
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        self._enrichment_future = None
+        self._enrichment_pending_turn = -1
+        self._enrichment_pending_session_id = None
+        logger.info(f"Enricher: dropped pending future ({reason})")
 
     def _calculate_budget(self) -> int:
         """Calculate context window budget from config.
@@ -597,6 +690,7 @@ class CustomRouterContextEngine(ContextEngine):
                 self._processed_msg_count = 0
                 self._binding_origin_idx = 0
                 self._last_enrichment_turn = -1
+                self._drop_pending_enrichment("drift-resume")
                 if previous and previous != hermes_sid:
                     try:
                         conn = self.store._get_connection()
@@ -642,6 +736,7 @@ class CustomRouterContextEngine(ContextEngine):
                     hermes_sid, self.current_segment_id
                 )
                 self._last_enrichment_turn = -1
+                self._drop_pending_enrichment("drift-dead-to-fresh")
             else:
                 logger.info(
                     f"compress: session drift detected (FRESH). plugin={previous!r} "
@@ -700,6 +795,7 @@ class CustomRouterContextEngine(ContextEngine):
                     hermes_sid, self.current_segment_id
                 )
                 self._last_enrichment_turn = -1
+                self._drop_pending_enrichment("drift-fresh")
                 # Lazy session row (A0): do not create a sessions row here
                 # unless we just reassigned events into it (in which case
                 # reassign_session already created the row atomically and
@@ -845,12 +941,10 @@ class CustomRouterContextEngine(ContextEngine):
                     logger.warning(f"Embed executor unavailable, doing inline batch: {e}")
                     _embed_chunks(pending_embeddings, batch_size)
 
-            # Optional LLM enrichment (Stage 5.1).
-            # Hybrid trigger: every N turns OR on segment boundary.
-            self._maybe_enrich(segment_changed_this_turn)
-
             # Save state to DB (A4: execution_state + state_history written
             # atomically in one transaction so they cannot diverge on crash).
+            # Done BEFORE the pass-through guard so ingest mutations survive
+            # a pass-through return.
             self.store.commit_state(self.session_id, self._current_state)
 
         # ---
@@ -886,6 +980,13 @@ class CustomRouterContextEngine(ContextEngine):
         effective_tokens = (
             max(content_tokens, current_tokens or 0) + self._observed_prompt_overhead
         )
+
+        # Enrichment: collect any finished bg future + maybe submit a new one.
+        # Cheap on the hot path (LLM call runs in a background executor); kept
+        # below the pass-through computation so the decision itself never waits
+        # on it. Runs in both branches so the trigger cadence stays consistent.
+        self._maybe_enrich(segment_changed_this_turn)
+
         # H: resume context-fill — on the first turn after a session is
         # resumed (process restart, /resume, drift-RESUME), skip the
         # pass-through shortcut even when the buffer is small. The LLM
@@ -1379,6 +1480,7 @@ class CustomRouterContextEngine(ContextEngine):
             self._processed_msg_count = 0
             self._binding_origin_idx = 0
             self._last_enrichment_turn = -1
+            self._drop_pending_enrichment("on_session_start RESUME")
             # B5: this is a resume, not a new session — suppress the
             # bootstrap probe so we don't surface cross-session candidates
             # that the user already knows about.
@@ -1422,6 +1524,7 @@ class CustomRouterContextEngine(ContextEngine):
             "enrichment": {"decision_summary": None, "intent_label": None, "topic_tags": []}
         }
         self._last_enrichment_turn = -1
+        self._drop_pending_enrichment("on_session_start fresh")
         logger.info(f"Session started fresh: {session_id} on {interface}")
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -1458,6 +1561,7 @@ class CustomRouterContextEngine(ContextEngine):
         self._cross_session_candidates = []
         self._current_state = self._make_default_state(None, None)
         self._last_enrichment_turn = -1
+        self._drop_pending_enrichment("on_session_reset")
         # A6: mark previous session 'closed' if it was still active in the DB,
         # also bump last_active so the row reflects when /reset happened
         # (otherwise stale `last_active` confuses any cross-session "last
