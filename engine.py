@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -212,6 +213,46 @@ class CustomRouterContextEngine(ContextEngine):
         # Reindex check (Stage 4): if embedding model in DB differs from config —
         # either re-embed everything or warn, depending on reindex_on_model_change.
         self._check_and_reindex_embeddings()
+
+    def __deepcopy__(self, memo):
+        """Create an agent-local engine without copying unsafe runtime state."""
+        cached = memo.get(id(self))
+        if cached is not None:
+            return cached
+
+        clone = type(self)(
+            db_path=self.store.db_path,
+            config=config_module.PluginConfig(self.config.as_dict),
+        )
+        memo[id(self)] = clone
+
+        for attr in (
+            "last_prompt_tokens",
+            "last_completion_tokens",
+            "last_total_tokens",
+            "threshold_tokens",
+            "context_length",
+            "compression_count",
+            "threshold_percent",
+            "protect_first_n",
+            "protect_last_n",
+        ):
+            setattr(clone, attr, copy.deepcopy(getattr(self, attr), memo))
+
+        clone._budget_tokens = copy.deepcopy(self._budget_tokens, memo)
+        clone._hermes_llm.clear()
+        clone._hermes_llm.update(copy.deepcopy(self._hermes_llm, memo))
+        clone._observed_prompt_overhead = copy.deepcopy(self._observed_prompt_overhead, memo)
+        clone._last_content_estimate = copy.deepcopy(self._last_content_estimate, memo)
+        clone.prompt_builder = prompt_builder.PromptBuilder(
+            total_budget=clone._budget_tokens,
+            tokenizer_model=clone.config.get("tokenizer_model", "cl100k_base"),
+            protected_tail_turns=clone.config.get("protected_tail_turns", 20),
+            state_budget_ratio=clone.config.get("state_budget_ratio", 0.05),
+            retrieved_budget_ratio=clone.config.get("retrieved_budget_ratio", 0.45),
+            protected_tail_ratio=clone.config.get("protected_tail_ratio", None),
+        )
+        return clone
 
     def _check_and_reindex_embeddings(self) -> None:
         """Stage 4: detect embedding model change in DB vs config.
@@ -598,7 +639,14 @@ class CustomRouterContextEngine(ContextEngine):
         """
         return True
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        force: bool = False,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
         """
         Main entry point called by Hermes each turn.
         1. Ingest new messages into event store
@@ -606,7 +654,10 @@ class CustomRouterContextEngine(ContextEngine):
         3. Index embeddings
         4. Assemble context package within token budget
         """
-        logger.info(f"compress called: messages={len(messages)}, current_tokens={current_tokens}, budget={self._budget_tokens}")
+        logger.info(
+            f"compress called: messages={len(messages)}, current_tokens={current_tokens}, "
+            f"budget={self._budget_tokens}, force={force}"
+        )
         # Auto-rebind to Hermes' current session_id if it drifted out from
         # under us. Hermes rotates self.session_id on /new and on every
         # compression boundary; the plugin learns about compression boundaries

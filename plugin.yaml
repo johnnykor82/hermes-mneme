@@ -1,5 +1,5 @@
 name: hermes-mneme
-version: 0.2.0
+version: 0.2.1
 description: "Retrieval-based context engine for Hermes — execution-graph-aware memory replacement for the default compressor."
 author: "Hermes-Mneme Contributors"
 license: "Apache-2.0"
