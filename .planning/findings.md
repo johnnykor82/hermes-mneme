@@ -17,3 +17,5 @@
 - Current Hermes copies the plugin singleton before `update_model()` and does not require the plugin copy to carry `agent` state. Fresh clone semantics are correct for this compatibility fix.
 - Programmatic smoke must not run from the plugin directory because local `tools.py` shadows Hermes' `tools` package. Running the same check from `/private/tmp` succeeds.
 - Temporary-home smoke result: plugin discovery registered `hermes-mneme`; `copy.deepcopy()` succeeded; `update_model()` produced context length `128000` and budget `89600`; no fallback warning was logged.
+- GitHub Actions failure for run `28973003465` was a pytest collection error, not a runtime regression: `tests/unit/test_current_hermes_compat.py` imported `hermes_mneme.engine`, which imports `agent.context_engine`. CI installs `hermes-mneme` standalone and does not have the Hermes Agent `agent` package.
+- Existing diagnostic scripts already had the correct pattern: install minimal Hermes-side stubs before importing the plugin engine. The shared pytest bootstrap now uses the same pattern only when real Hermes modules are absent.

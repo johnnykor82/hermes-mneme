@@ -68,6 +68,7 @@ Active Task: none (leaf)
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+| GitHub Actions run `28973003465` failed during pytest collection: `ModuleNotFoundError: No module named 'agent'` in `tests/unit/test_current_hermes_compat.py`. | 1 | Added standalone Hermes test stubs in `tests/conftest.py` when `agent.context_engine` is unavailable; local workflow command now passes. |
 
 ---
 

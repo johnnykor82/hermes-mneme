@@ -47,3 +47,11 @@
 - No `could not be safely copied` fallback warning appeared in temp logs.
 - Phase `02-hermes-smoke` marked complete.
 - Active phase advanced to `03-publish-main`.
+
+## 2026-07-09 CI Failure Follow-up
+
+- GitHub Actions run `28973003465` failed in pytest collection on Python 3.11 and 3.12; Python 3.10 was cancelled after fail-fast.
+- Root cause: CI lacks Hermes Agent's `agent.context_engine`, while the new compatibility test imports `hermes_mneme.engine`.
+- Added conditional Hermes-side stubs to `tests/conftest.py` for standalone pytest environments.
+- Reproduced the first boundary locally with system Python: `agent` import no longer fails; the next missing dependency is `tiktoken`, which CI installs.
+- Verified local workflow command with Hermes venv: `pytest tests/ -v` -> `39 passed`.
