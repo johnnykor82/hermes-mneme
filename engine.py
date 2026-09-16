@@ -125,6 +125,7 @@ class CustomRouterContextEngine(ContextEngine):
         self.tools = tools.ContextTools(self.store, self.indexer, self.context_router, self.graph, engine=self)
 
         self._processed_msg_count = 0
+        self._native_request_cache = None
         # A5: cached session_id from on_session_start, used by compress() if
         # hermes_logging._session_context is unavailable.
         self._pending_session_id: Optional[str] = None
@@ -566,6 +567,7 @@ class CustomRouterContextEngine(ContextEngine):
                      api_key: str = "", provider: str = "", **kwargs) -> None:
         """Called by Hermes when model switches. Recalculate budget and
         capture LLM endpoint params for use by enricher fallback."""
+        self._native_request_cache = None
         self.context_length = context_length
         self._budget_tokens = self._calculate_budget()
         # Save Hermes LLM params; enricher reads from this dict at call-time.
@@ -632,31 +634,171 @@ class CustomRouterContextEngine(ContextEngine):
             f"observed_overhead={self._observed_prompt_overhead}"
         )
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
-        """Always returns True — this engine replaces the default compressor
-        and must be called on every turn to assemble context.
-        The plugin manages its own token budget inside compress().
-        """
-        return True
+    def _native_request_hook_name(self) -> Optional[str]:
+        """Return the native request hook supported by this Hermes host."""
+        if callable(getattr(ContextEngine, "select_context", None)):
+            return "select_context"
+        if callable(getattr(ContextEngine, "prepare_request_messages", None)):
+            return "prepare_request_messages"
+        return None
 
-    def compress(
+    def _native_hooks_available(self) -> bool:
+        """True when the host Hermes supports native observe + request hooks."""
+        return (
+            callable(getattr(ContextEngine, "on_turn_complete", None))
+            and self._native_request_hook_name() is not None
+        )
+
+    def should_compress(self, prompt_tokens: int = None) -> bool:
+        """Legacy fallback for Hermes versions without native Mneme hooks."""
+        return not self._native_hooks_available()
+
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Native post-turn ingestion hook."""
+        self._native_request_cache = None
+        if not self._native_hooks_available():
+            return None
+        self._process_context_messages(
+            messages,
+            current_tokens=None,
+            assemble=False,
+            caller="on_turn_complete",
+        )
+        return None
+
+    def select_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+        **kwargs: Any,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Native Hermes pre-request context selection hook."""
+        return self._prepare_native_request_context(
+            request_messages,
+            conversation_messages=conversation_messages,
+            incoming_message=incoming_message,
+            budget_tokens=budget_tokens,
+            caller="select_context",
+        )
+
+    def prepare_request_messages(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+        **kwargs: Any,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Compatibility hook for the pre-merge Hermes prototype."""
+        return self._prepare_native_request_context(
+            request_messages,
+            conversation_messages=conversation_messages,
+            incoming_message=incoming_message,
+            budget_tokens=budget_tokens,
+            caller="prepare_request_messages",
+        )
+
+    def _prepare_native_request_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+        caller: str = "select_context",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Assemble request-only context for native Hermes hosts."""
+        if not self._native_hooks_available():
+            self._native_request_cache = None
+            return None
+        # Mirror ingestion's host-session precedence before a cache hit can
+        # bypass drift detection. Keep only the most recent request snapshot.
+        try:
+            from hermes_logging import _session_context
+            host_session_id = getattr(_session_context, "session_id", None)
+        except Exception:
+            host_session_id = None
+        host_session_id = (
+            host_session_id
+            or self._pending_session_id
+            or getattr(getattr(self, "agent", None), "session_id", None)
+            or self.session_id
+        )
+        cache_key = [
+            self.session_id, host_session_id, self._budget_tokens, budget_tokens,
+            request_messages, conversation_messages, incoming_message,
+        ]
+        cached = getattr(self, "_native_request_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return copy.deepcopy(cached[1])
+        self._native_request_cache = None
+        cache_key = copy.deepcopy(cache_key)
+        source_messages = conversation_messages if conversation_messages is not None else request_messages
+        if not source_messages:
+            return None
+        request_system_prompt = None
+        for msg in request_messages or []:
+            if (msg or {}).get("role") == "system":
+                request_system_prompt = str((msg or {}).get("content", ""))
+                break
+        request_tail = [m for m in request_messages if m.get("role") != "system"]
+        prepared = self._process_context_messages(
+            source_messages,
+            current_tokens=None,
+            assemble=True,
+            caller=caller,
+            system_prompt_override=request_system_prompt,
+            request_tail=request_tail,
+        )
+        if prepared is source_messages or prepared is request_tail:
+            prepared = None
+        # Ingestion can rebind the session. Snapshot the result before the
+        # host sanitizers mutate it, retaining consumed one-shot context.
+        cache_key[0] = self.session_id
+        self._native_request_cache = (cache_key, copy.deepcopy(prepared))
+        return prepared
+
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None,
+                 focus_topic: str = None, force: bool = False, **kwargs) -> List[Dict[str, Any]]:
+        """Legacy Hermes entry point for hosts without native hooks."""
+        return self._process_context_messages(
+            messages,
+            current_tokens=current_tokens,
+            focus_topic=focus_topic,
+            assemble=True,
+            caller="legacy_compress",
+        )
+
+    def _process_context_messages(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
         focus_topic: str = None,
-        force: bool = False,
-        **kwargs,
+        *,
+        assemble: bool = True,
+        caller: str = "context_cycle",
+        system_prompt_override: Optional[str] = None,
+        request_tail: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Main entry point called by Hermes each turn.
+        Shared context pipeline.
         1. Ingest new messages into event store
         2. Update execution state
         3. Index embeddings
-        4. Assemble context package within token budget
+        4. Optionally assemble context package within token budget
         """
         logger.info(
-            f"compress called: messages={len(messages)}, current_tokens={current_tokens}, "
-            f"budget={self._budget_tokens}, force={force}"
+            f"{caller} called: messages={len(messages)}, current_tokens={current_tokens}, "
+            f"budget={self._budget_tokens}, assemble={assemble}"
         )
         # Auto-rebind to Hermes' current session_id if it drifted out from
         # under us. Hermes rotates self.session_id on /new and on every
@@ -863,7 +1005,7 @@ class CustomRouterContextEngine(ContextEngine):
                     except Exception as e:
                         logger.warning(f"compress: drift rebind close-previous failed: {e}")
         if not self.session_id:
-            logger.warning("compress called but no session_id.")
+            logger.warning(f"{caller} called but no session_id.")
             return messages
 
         # Resolve sentinel: decide between RESUME and FRESH binding.
@@ -998,6 +1140,18 @@ class CustomRouterContextEngine(ContextEngine):
             # a pass-through return.
             self.store.commit_state(self.session_id, self._current_state)
 
+        if not assemble:
+            return messages
+
+        # Persist only conversation history; request-only prefill and hook
+        # additions must still survive prompt assembly.
+        request_prefix = []
+        if request_tail is not None:
+            history_length = sum(m.get("role") != "system" for m in messages)
+            prefix_length = max(0, len(request_tail) - history_length)
+            request_prefix = request_tail[:prefix_length]
+            messages = request_tail[prefix_length:] if prefix_length else request_tail
+
         # ---
         # 1.5. Pass-through guard: if the incoming buffer is below the budget,
         # we don't need to rewrite anything. Returning `messages` as-is keeps
@@ -1015,7 +1169,7 @@ class CustomRouterContextEngine(ContextEngine):
         try:
             content_tokens = sum(
                 self.prompt_builder.tokenizer(str(m.get("content", ""))) + 4
-                for m in messages
+                for m in [*request_prefix, *messages]
             )
         except Exception:
             content_tokens = 0
@@ -1056,7 +1210,7 @@ class CustomRouterContextEngine(ContextEngine):
                 f"effective={effective_tokens} < budget={self._budget_tokens} "
                 f"— returning original messages ({len(messages)}) without assembly."
             )
-            return messages
+            return request_tail if request_tail is not None else messages
         else:
             logger.info(
                 f"Assembly needed: content={content_tokens}, current={current_tokens}, "
@@ -1282,11 +1436,13 @@ class CustomRouterContextEngine(ContextEngine):
         # collision check fires too late: the real prompt sent to the LLM is
         # `system + tools + content` (~37k tokens of overhead in observed runs).
         if self.prompt_builder.system_prompt_tokens == 0:
-            sys_msgs = [m for m in messages if (m or {}).get("role") == "system"]
-            if sys_msgs:
-                sp_tokens = self.prompt_builder.tokenizer(
-                    str(sys_msgs[0].get("content", ""))
-                )
+            system_prompt_text = system_prompt_override
+            if system_prompt_text is None:
+                sys_msgs = [m for m in messages if (m or {}).get("role") == "system"]
+                if sys_msgs:
+                    system_prompt_text = str(sys_msgs[0].get("content", ""))
+            if system_prompt_text:
+                sp_tokens = self.prompt_builder.tokenizer(system_prompt_text)
                 # If Hermes also reports current_tokens, use the bigger of the
                 # two — the gap between content_tokens and current_tokens is
                 # the real overhead (system prompt + tool schemas + reasoning).
@@ -1302,15 +1458,32 @@ class CustomRouterContextEngine(ContextEngine):
         cross_session_payload = self._cross_session_candidates or None
         if cross_session_payload:
             self._cross_session_candidates = []
+        latest_request_role = next(
+            (
+                (m or {}).get("role")
+                for m in reversed(messages)
+                if (m or {}).get("role") != "system"
+            ),
+            None,
+        )
+        append_current_user_message = latest_request_role == "user"
+        if not append_current_user_message and current_user_message:
+            logger.info(
+                "Tool-continuation assembly: preserving request tail without "
+                "re-appending the current user message."
+            )
         final_messages = self.prompt_builder.build(
             execution_state=self._current_state,
             retrieved_candidates=deduped_candidates,
             recent_messages=recent_messages_for_prompt,
             current_user_message=current_user_message,
+            append_current_user_message=append_current_user_message,
+            request_prefix=request_prefix,
             goal_trail=self._build_goal_trail(),
             memory_access_hint=self._build_memory_access_hint(),
             checkpoint_block=self._consume_pending_checkpoint(),
             cross_session_candidates=cross_session_payload,
+            system_prompt_override=system_prompt_override,
         )
 
         # Observability logging
@@ -1415,6 +1588,7 @@ class CustomRouterContextEngine(ContextEngine):
         history under the new id. The flag is gone now — only Hermes can
         declare a boundary.
         """
+        self._native_request_cache = None
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self.session_id
@@ -1579,6 +1753,7 @@ class CustomRouterContextEngine(ContextEngine):
         logger.info(f"Session started fresh: {session_id} on {interface}")
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        self._native_request_cache = None
         logger.info(f"Session ended: {session_id}")
         conn = self.store._get_connection()
         conn.execute("UPDATE sessions SET status='closed' WHERE session_id=?", (session_id,))
@@ -1600,6 +1775,7 @@ class CustomRouterContextEngine(ContextEngine):
         proper on_session_start binds us — which the build_system_prompt
         hook does for fresh sessions.
         """
+        self._native_request_cache = None
         super().on_session_reset()
         previous = self.session_id
         logger.info(f"on_session_reset: clearing in-memory binding (was session_id={previous!r})")

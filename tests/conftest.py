@@ -45,6 +45,12 @@ def _ensure_hermes_test_stubs() -> None:
             def on_session_reset(self) -> None:
                 pass
 
+            def select_context(self, request_messages, *, conversation_messages=None, incoming_message=None, budget_tokens=0):
+                return None
+
+            def on_turn_complete(self, messages, usage=None, **kwargs) -> None:
+                return None
+
             def get_status(self) -> Dict[str, Any]:
                 return {}
 

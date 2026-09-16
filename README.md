@@ -26,6 +26,12 @@ The default compressor drops detail when the window fills. LCM keeps everything 
 
 ## Install
 
+Version 0.4.0 uses Hermes' native `select_context()` and
+`on_turn_complete()` hooks when both are available. Context selection changes
+only the outgoing request; completed turns are ingested into memory without
+forcing `compress()` on every step. Older Hermes builds retain the legacy
+compression-based integration. Restart Hermes after updating the plugin.
+
 ```bash
 git clone https://github.com/johnnykor82/hermes-mneme.git \
   ~/.hermes/plugins/hermes-mneme
@@ -68,7 +74,7 @@ See [`docs/`](docs/) for component-level deep-dives:
 - `classifier.py` — intent signals (no LLM)
 - `router.py` — query construction, retrieval, scoring (Stages 6–7)
 - `prompt_builder.py` — token-budget enforcement
-- `engine.py` — main lifecycle (compress, on_session_start, …)
+- `engine.py` — main lifecycle (select_context, on_turn_complete, on_session_start; legacy compress fallback)
 - `graph.py` — execution graph + dependency propagation
 - `tools.py` — agent memory tools
 
@@ -84,7 +90,7 @@ When new commits land on `main`:
 
 ```bash
 cd ~/.hermes/plugins/hermes-mneme
-git pull
+git pull --ff-only
 ./install.sh              # reinstalls deps if requirements changed
 hermes gateway restart
 ```

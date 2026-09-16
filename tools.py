@@ -15,6 +15,36 @@ class ContextTools:
         self.graph = graph
         self.engine = engine  # back-reference for in-memory state fallback
 
+    def _resolve_event_id(self, event_id: str):
+        """Resolve a full event id or a unique displayed prefix."""
+        if not event_id:
+            return None, {"error": "event_id required"}
+        conn = self.store._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row:
+                return row["id"], None
+            if len(event_id) < 8:
+                return None, {"error": "Event not found", "event_id": event_id}
+            rows = conn.execute(
+                "SELECT id FROM events WHERE id LIKE ? ORDER BY id LIMIT 6",
+                (f"{event_id}%",),
+            ).fetchall()
+        finally:
+            conn.close()
+        if len(rows) == 1:
+            return rows[0]["id"], None
+        if len(rows) > 1:
+            return None, {
+                "error": "Ambiguous event_id prefix",
+                "event_id": event_id,
+                "matches": [r["id"] for r in rows[:5]],
+            }
+        return None, {"error": "Event not found", "event_id": event_id}
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -80,7 +110,7 @@ class ContextTools:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "event_id": {"type": "string", "description": "Event id from context_search / expand_context / retrieved chunk."},
+                        "event_id": {"type": "string", "description": "Full event id or unique displayed prefix from context_search / expand_context / retrieved chunk."},
                         "full": {"type": "boolean", "default": False, "description": "Return the original content without truncation."}
                     },
                     "required": ["event_id"]
@@ -105,7 +135,7 @@ class ContextTools:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "seed_event_id": {"type": "string", "description": "Event id to start from (required for neighbors; optional for segment if segment_id is given)."},
+                        "seed_event_id": {"type": "string", "description": "Full event id or unique displayed prefix to start from (required for neighbors; optional for segment if segment_id is given)."},
                         "segment_id": {"type": "string", "description": "Segment id (mode='segment' only)."},
                         "mode": {"type": "string", "enum": ["neighbors", "segment"], "default": "neighbors"},
                         "depth": {"type": "integer", "default": 1, "description": "BFS depth, 1-5 (mode='neighbors' only)."}
@@ -321,8 +351,9 @@ class ContextTools:
 
     def _fetch_event(self, args: Dict) -> str:
         event_id = args.get("event_id")
-        if not event_id:
-            return json.dumps({"error": "event_id required"})
+        event_id, error = self._resolve_event_id(event_id)
+        if error:
+            return json.dumps(error, ensure_ascii=False)
         full = bool(args.get("full", False))
 
         conn = self.store._get_connection()
@@ -353,6 +384,9 @@ class ContextTools:
             if not segment_id:
                 if not seed_event_id:
                     return json.dumps({"error": "segment mode requires segment_id or seed_event_id"})
+                seed_event_id, error = self._resolve_event_id(seed_event_id)
+                if error:
+                    return json.dumps(error, ensure_ascii=False)
                 conn = self.store._get_connection()
                 try:
                     row = conn.execute(
@@ -369,6 +403,27 @@ class ContextTools:
                 seed_session = session_id
             try:
                 skeleton = self.store.get_segment_skeleton(seed_session, segment_id, max_events=15)
+                if seed_event_id and not any(
+                    ev.get("event_id") == seed_event_id for ev in skeleton
+                ):
+                    conn = self.store._get_connection()
+                    try:
+                        seed_row = conn.execute(
+                            "SELECT id, type, tool_name, timestamp, content "
+                            "FROM events WHERE id = ?",
+                            (seed_event_id,),
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                    if seed_row:
+                        skeleton.append({
+                            "event_id": seed_row["id"],
+                            "type": seed_row["type"],
+                            "tool_name": seed_row["tool_name"],
+                            "timestamp": seed_row["timestamp"],
+                            "snippet": (seed_row["content"] or "")[:200],
+                        })
+                        skeleton.sort(key=lambda ev: ev.get("timestamp") or "")
                 return json.dumps({
                     "segment_id": segment_id,
                     "session_id": seed_session,
@@ -380,6 +435,9 @@ class ContextTools:
         depth = min(int(args.get("depth", 1) or 1), 5)
         if not seed_event_id:
             return json.dumps({"error": "seed_event_id required"})
+        seed_event_id, error = self._resolve_event_id(seed_event_id)
+        if error:
+            return json.dumps(error, ensure_ascii=False)
 
         try:
             neighbors = self.graph.get_neighbors(seed_event_id, depth=depth)

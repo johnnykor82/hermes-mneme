@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-16
+
+### Added
+- Native Hermes context-engine integration for current `main`:
+  `select_context()` prepares request-only context before the provider call,
+  and `on_turn_complete()` ingests the finalized turn after completion.
+- Compatibility fallback for the pre-merge prototype hook
+  `prepare_request_messages()`.
+- Tests covering the native hook contract against current Hermes main.
+
+### Changed
+- `should_compress()` now disables the legacy every-turn compression path when
+  the host Hermes exposes both native hooks, while preserving the old behavior
+  on older Hermes builds.
+- Prompt assembly preserves the current request tail during tool-continuation
+  calls instead of re-appending the previous user message.
+- Request-only prefill stays ahead of conversation history during assembly
+  and is not ingested into the event store.
+- Identical native request retries retain their selected memory context.
+- `fetch_event` and `expand_context` accept unique event-id prefixes, matching
+  the ids agents usually see in retrieved memory snippets.
+
 ## [0.3.0] - 2026-05-09
 
 ### Added — memory navigation (Stage B in `docs/DIVERGENCE.md`)

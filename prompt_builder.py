@@ -60,6 +60,8 @@ class PromptBuilder:
         retrieved_candidates: List[Any],  # List of RetrievalCandidate
         recent_messages: List[Dict[str, Any]],  # Last N turns (OpenAI format)
         current_user_message: str,
+        append_current_user_message: bool = True,
+        request_prefix: Optional[List[Dict[str, Any]]] = None,
         system_prompt_override: str = None,
         goal_trail: Optional[List[Dict[str, Any]]] = None,
         memory_access_hint: Optional[str] = None,
@@ -86,7 +88,11 @@ class PromptBuilder:
         2. Truncate protected_tail from oldest (min 2 turns)
         3. Execution state is NEVER dropped
         """
-        effective_budget = self.total_budget - self.system_prompt_tokens
+        prefix_tokens = sum(
+            self.tokenizer(str(m.get("content", ""))) + 4
+            for m in (request_prefix or [])
+        )
+        effective_budget = self.total_budget - self.system_prompt_tokens - prefix_tokens
 
         # Budget allocations
         state_budget = int(effective_budget * self.state_budget_ratio)
@@ -163,6 +169,7 @@ class PromptBuilder:
         recent_messages = list(recent_messages)
         if (
             recent_messages
+            and append_current_user_message
             and current_user_message
             and recent_messages[-1].get("role") == "user"
             and str(recent_messages[-1].get("content", "")).strip()
@@ -192,7 +199,11 @@ class PromptBuilder:
             )
 
         # 4. Current user message
-        current_msg_tokens = self.tokenizer(current_user_message)
+        current_msg_tokens = (
+            self.tokenizer(current_user_message)
+            if append_current_user_message and current_user_message
+            else 0
+        )
 
         # 4b. Tail extension — fill unused headroom with OLDER turns.
         # The floor at `protected_tail_turns` is the minimum, not the cap. On
@@ -279,6 +290,7 @@ class PromptBuilder:
         final_messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
+        final_messages.extend(request_prefix or [])
 
         # Retrieved context as a synthetic user message before recent turns
         if retrieved_chunks_text:
@@ -289,8 +301,8 @@ class PromptBuilder:
         for msg in tail_messages:
             final_messages.append(msg)
 
-        # Current user message
-        final_messages.append({"role": "user", "content": current_user_message})
+        if append_current_user_message and current_user_message:
+            final_messages.append({"role": "user", "content": current_user_message})
 
         final_total = self.tokenizer(system_content) + sum(
             self.tokenizer(str(m.get("content", ""))) + 4 for m in final_messages[1:]
