@@ -21,7 +21,9 @@ The JSON report includes per-session targets and affected rows; before/after cou
 
 ## Upgrading from 0.5.1
 
-Upgrading from 0.5.1 to 0.5.2 requires no additional segment migration. Keep existing backups. The resume fix preserves old event IDs and graph rows; retained text that an older parser omitted can be recovered on resume. It prevents new replay duplicates but does not delete historical duplicate rows. Where old call IDs are absent and repeated content is indistinguishable, matching is chronological rather than a reconstruction of the original provider identity.
+Upgrading from 0.5.1 to 0.5.2 requires no additional segment migration. Keep existing backups. The resume fix preserves old event IDs and graph rows; retained text that an older parser omitted can be recovered on resume. It prevents new replay duplicates but does not delete historical duplicate rows. Where old call IDs are absent and repeated content is indistinguishable, matching consumes separate historical occurrences rather than reconstructing the original provider identity.
+
+Hermes may replace old tool results in its active transcript with `[Old tool output cleared to save context space]`. During retained-history replay, 0.5.2 recognizes that exact placeholder only through an existing provider call ID or an already matched historical call and its graph edge. The complete stored result remains unchanged; an unrelated call cannot reuse it merely because its placeholder text is identical.
 
 ## Restore
 

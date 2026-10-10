@@ -5,7 +5,7 @@ import os
 import threading
 import uuid
 from functools import wraps
-from bisect import bisect_right
+from collections import deque
 from typing import Dict, List, Any, Optional
 
 MEMORY_ACCESS_HINT_SHORT = """[MEMORY ACCESS]
@@ -322,14 +322,34 @@ class CustomRouterContextEngine(ContextEngine):
             rows = conn.execute(
                 "SELECT id,role,type,content,tool_call_id FROM events WHERE session_id=? "
                 "ORDER BY timestamp,id", (self.session_id,)).fetchall()
-            # Align only this lifecycle boundary's retained history. Missing
-            # legacy mixed text and duplicated old rows may leave gaps.
-            positions = {}
-            for index, row in enumerate(rows):
+            # Only retained history at a lifecycle boundary is eligible.
+            # Recovered legacy text is appended later, and compression can
+            # reorder history, so chronology cannot align distinct payloads.
+            occurrences = {}
+            for row in rows:
                 signature = (row["role"], row["type"], row["content"], row["tool_call_id"])
-                positions.setdefault(signature, []).append(index)
+                occurrences.setdefault(signature, deque()).append(row["id"])
+            outputs_by_call = {}
+            output_metadata = {}
+            for row in rows:
+                if row["type"] == "tool_output":
+                    output_metadata[row["id"]] = row["tool_call_id"]
+                    if row["tool_call_id"]:
+                        outputs_by_call.setdefault(row["tool_call_id"], deque()).append(row["id"])
+            graph_outputs = {}
+            for row in conn.execute(
+                    "SELECT g.from_event_id,g.to_event_id FROM execution_graph g "
+                    "JOIN events e ON e.id=g.to_event_id WHERE e.session_id=? "
+                    "AND e.type='tool_output' AND g.edge_type='tool_output' "
+                    "ORDER BY e.timestamp,e.id", (self.session_id,)):
+                graph_outputs.setdefault(row["from_event_id"], deque()).append(row["to_event_id"])
+            used = set()
+            matched_calls = {}
+            def take(event_ids):
+                while event_ids and event_ids[0] in used:
+                    event_ids.popleft()
+                return event_ids.popleft() if event_ids else None
             matched = {}
-            cursor = -1
             for key, event in flat:
                 signature = (event["role"], event["type"], event["content"])
                 # Prefer an exact provider ID. Only missing legacy metadata
@@ -338,12 +358,33 @@ class CustomRouterContextEngine(ContextEngine):
                 if call_ids[0] is not None:
                     call_ids.append(None)
                 for call_id in call_ids:
-                    indexes = positions.get((*signature, call_id), [])
-                    offset = bisect_right(indexes, cursor)
-                    if offset < len(indexes):
-                        cursor = indexes[offset]
-                        matched[key] = rows[cursor]["id"]
+                    event_ids = occurrences.get((*signature, call_id))
+                    existing_id = take(event_ids)
+                    if existing_id:
+                        matched[key] = existing_id
                         break
+                provider_id = event.get("tool_call_id")
+                # Hermes replaces old results in its active transcript. Only
+                # that exact placeholder may reuse a provider/graph-correlated
+                # original; never discard a new result merely by its text.
+                if (key not in matched and event["type"] == "tool_output" and provider_id
+                        and event["content"] == "[Old tool output cleared to save context space]"):
+                    existing_id = take(outputs_by_call.get(provider_id))
+                    if not existing_id:
+                        candidates = graph_outputs.get(matched_calls.get(provider_id))
+                        while candidates:
+                            candidate = take(candidates)
+                            if candidate is None:
+                                break
+                            if output_metadata[candidate] in (None, provider_id):
+                                existing_id = candidate
+                                break
+                    if existing_id:
+                        matched[key] = existing_id
+                if key in matched:
+                    used.add(matched[key])
+                    if event["type"] == "tool_call" and provider_id:
+                        matched_calls[provider_id] = matched[key]
             return matched
         finally:
             conn.close()

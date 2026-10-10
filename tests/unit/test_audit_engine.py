@@ -200,6 +200,66 @@ def test_resume_legacy_mixed_text_and_duplicate_rows_align(eng):
     assert eng.store.count_events('A') == before + 5
 
 
+@pytest.mark.parametrize('legacy_ids', [False, True])
+def test_resume_pruned_outputs_reuses_correlated_originals(eng, legacy_ids):
+    eng.on_session_start('A')
+    first = _tool_history()
+    second = copy.deepcopy(first)
+    second[1]['tool_calls'][0]['id'] = 'call-other'
+    second[1]['tool_calls'][0]['function']['arguments'] = '{"other": true}'
+    second[2]['tool_call_id'] = 'call-other'
+    second[2]['content'] = 'other original output'
+    eng.on_turn_complete(first + second)
+    conn = eng.store._get_connection()
+    original = list(conn.execute("SELECT id,content FROM events WHERE type='tool_output' ORDER BY timestamp,id"))
+    if legacy_ids:
+        conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
+        conn.commit()
+    conn.close()
+    replay = copy.deepcopy(first + second)
+    for message in replay:
+        if message['role'] == 'tool':
+            message['content'] = '[Old tool output cleared to save context space]'
+    eng.on_session_start('A')
+    eng.on_turn_complete(replay)
+    assert eng.store.count_events('A') == 8
+    conn = eng.store._get_connection()
+    assert list(conn.execute("SELECT id,content FROM events WHERE type='tool_output' ORDER BY timestamp,id")) == original
+    conn.close()
+    # An unknown provider call cannot inherit either historical result.
+    unknown = copy.deepcopy(second)
+    unknown[1]['tool_calls'][0]['id'] = 'call-new'
+    unknown[1]['tool_calls'][0]['function']['arguments'] = '{"unseen": true}'
+    unknown[2]['tool_call_id'] = 'call-new'
+    unknown[2]['content'] = '[Old tool output cleared to save context space]'
+    eng.on_session_start('A')
+    assert (2, 0) not in eng._match_replay_prefix(unknown, 0)
+
+
+def test_repeated_resume_matches_backfilled_text_and_reordered_history(eng):
+    eng.on_session_start('A')
+    old = _tool_history()
+    eng.on_turn_complete(old)
+    conn = eng.store._get_connection()
+    conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
+    conn.commit()
+    conn.close()
+    canonical = copy.deepcopy(old)
+    canonical[1]['content'] = 'Previously omitted assistant explanation'
+    eng.on_session_start('A')
+    eng.on_turn_complete(canonical)
+    assert eng.store.count_events('A') == 5
+    for replay in (canonical, [canonical[3], *canonical[:3]], canonical):
+        eng.on_session_start('A')
+        eng.on_turn_complete(replay)
+        assert eng.store.count_events('A') == 5
+    incoming = old[0].copy()
+    eng.on_session_start('A')
+    eng.select_context(canonical + [incoming], conversation_messages=canonical + [incoming], incoming_message=incoming)
+    eng.on_turn_complete(canonical + [incoming, {'role': 'assistant', 'content': 'new answer'}])
+    assert eng.store.count_events('A') == 7
+
+
 def test_compression_identical_incoming_user_survives_api_retries(eng):
     incoming = {'role': 'user', 'content': 'repeat request'}
     eng.on_session_start('A')
