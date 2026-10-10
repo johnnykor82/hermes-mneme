@@ -1,10 +1,13 @@
 import requests
 import logging
 import sqlite3
-import json
 import struct
 import math
 import time
+import heapq
+import re
+import threading
+from collections import OrderedDict
 from typing import List, Optional, Dict, Any
 
 try:
@@ -26,9 +29,21 @@ JINA_MODEL = "jina-embeddings-v5-text-small-retrieval-mlx"
 class EmbeddingIndex:
     """Manages embedding generation and retrieval using Jina and sqlite-vec."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, config=None):
         self.db_path = db_path
-        self.embedding_dim = 1024
+        cfg = config if config is not None else {}
+        self.embedding_dim = int(cfg.get("embedding_dim", 1024))
+        if self.embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
+        self.model_id = cfg.get("embedding_model", JINA_MODEL)
+        self.embedding_model = self.model_id
+        self.embedding_api_key = cfg.get("embedding_api_key", JINA_API_KEY)
+        endpoint = cfg.get("embedding_endpoint", JINA_API_URL).rstrip("/")
+        self.embedding_endpoint = (endpoint if endpoint.endswith("/embeddings") else
+                                   endpoint + ("/embeddings" if endpoint.endswith("/v1") else "/v1/embeddings"))
+        self._embedding_cache = OrderedDict()
+        self._embedding_cache_lock = threading.RLock()
+        self._vec_dim = None
         self._vec_available = False
         self._init_vec_extension()
         # A10: simple circuit breaker for the Jina HTTP endpoint. After N
@@ -70,8 +85,13 @@ class EmbeddingIndex:
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
             row = conn.execute("SELECT vec_version()").fetchone()
+            schema = conn.execute("SELECT sql FROM sqlite_master WHERE name='vec_items'").fetchone()
+            match = re.search(r"float\[(\d+)\]", schema[0]) if schema else None
+            self._vec_dim = int(match.group(1)) if match else None
             conn.close()
             self._vec_available = True
+            if self._vec_dim is not None and self._vec_dim != self.embedding_dim:
+                logger.info("Configured embedding dimension %s differs from existing vec0 dimension %s; preserving vec0 and using canonical exact search", self.embedding_dim, self._vec_dim)
             logger.info(f"sqlite-vec extension loaded successfully. Version: {row[0] if row else '?'}")
         except Exception as e:
             logger.error(f"sqlite-vec load failed: {e}. Falling back to Python cosine.")
@@ -96,9 +116,25 @@ class EmbeddingIndex:
                 self._cb_logged_disabled = True
 
     def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Single-text embedding (compat shim — internally uses the batch path)."""
-        results = self.get_embeddings_batch([text])
-        return results[0] if results else None
+        """Reuse successful same-model query vectors across segmentation/retrieval.
+
+        Exact input is the cache key: whitespace normalization can alter the
+        embedding provider's semantics. Limit entries and cacheable input size.
+        The lock coalesces concurrent identical single-query requests.
+        """
+        key = (self.model_id, self.embedding_endpoint, self.embedding_dim, text)
+        with self._embedding_cache_lock:
+            cached = self._embedding_cache.get(key)
+            if cached is not None:
+                self._embedding_cache.move_to_end(key)
+                return list(cached)
+            results = self.get_embeddings_batch([text])
+            embedding = results[0] if results else None
+            if self._valid_embedding(embedding) and text and len(text) <= 64000:
+                self._embedding_cache[key] = tuple(embedding)
+                while len(self._embedding_cache) > 128:
+                    self._embedding_cache.popitem(last=False)
+            return embedding
 
     def get_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """Batch-embed via one Jina POST. Returns same-length list with None for
@@ -125,19 +161,27 @@ class EmbeddingIndex:
             self._cb_logged_disabled = False
         try:
             headers = {
-                "Authorization": f"Bearer {JINA_API_KEY}",
+                "Authorization": f"Bearer {self.embedding_api_key}",
                 "Content-Type": "application/json",
             }
-            payload = {"input": clean, "model": JINA_MODEL}
-            response = requests.post(JINA_API_URL, json=payload, headers=headers, timeout=60)
+            payload = {"input": clean, "model": self.model_id}
+            response = requests.post(self.embedding_endpoint, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
             items = (response.json() or {}).get("data") or []
             if len(items) != len(clean):
                 logger.error(f"Jina batch returned {len(items)}/{len(clean)} embeddings")
                 self._circuit_breaker_record_failure(RuntimeError("count mismatch"))
                 return out
-            for pos, item in zip(idx_to_pos, items):
-                out[pos] = item.get("embedding")
+            seen = set()
+            for fallback_index, item in enumerate(items):
+                item_index = item.get("index", fallback_index)
+                if not isinstance(item_index, int) or item_index not in range(len(clean)) or item_index in seen:
+                    raise ValueError("invalid embedding response index")
+                seen.add(item_index)
+                emb = item.get("embedding")
+                if not self._valid_embedding(emb):
+                    raise ValueError("embedding dimension or values do not match configuration")
+                out[idx_to_pos[item_index]] = emb
             self._circuit_breaker_record_success()
             return out
         except Exception as e:
@@ -163,9 +207,17 @@ class EmbeddingIndex:
         conn = self._get_connection()
         stored = 0
         try:
+            # Embedding HTTP happens before the transaction. Resolve the event's
+            # current segment under the write lock: a compression rebind can
+            # have moved it while the request was in flight.
+            conn.execute("BEGIN IMMEDIATE")
             for rec, emb in zip(records, embeddings):
                 event_id, segment_id, _text, model_id, token_count, ev_type = rec
-                if not emb:
+                current = conn.execute("SELECT segment_id FROM events WHERE id=?", (event_id,)).fetchone()
+                if current:
+                    segment_id = current[0]
+                if not self._valid_embedding(emb):
+                    logger.warning("Skipping embedding with invalid dimension/values for event %s", event_id)
                     continue
                 try:
                     embedding_bytes = struct.pack(f'{len(emb)}f', *emb)
@@ -176,21 +228,23 @@ class EmbeddingIndex:
                         (event_id, segment_id, embedding_bytes, model_id, token_count, ev_type),
                     )
                     if self._vec_available:
-                        try:
+                        # Replace every old mapping for this event/model in the same
+                        # transaction; repeated embedding must not grow vec0.
+                        old_rows = conn.execute(
+                            "SELECT rowid FROM vec_items_meta WHERE event_id=? AND embedding_model_id=?",
+                            (event_id, model_id),
+                        ).fetchall()
+                        for (rowid,) in old_rows:
+                            conn.execute("DELETE FROM vec_items WHERE rowid=?", (rowid,))
+                        conn.execute("DELETE FROM vec_items_meta WHERE event_id=? AND embedding_model_id=?", (event_id, model_id))
+                        if self._vec_dim == len(emb):
+                            cursor = conn.execute("INSERT INTO vec_items (embedding) VALUES (?)", (embedding_bytes,))
                             conn.execute(
-                                "INSERT OR REPLACE INTO vec_items (embedding) VALUES (?)",
-                                (embedding_bytes,),
+                                "INSERT INTO vec_items_meta (rowid, event_id, embedding_model_id, segment_id) VALUES (?, ?, ?, ?)",
+                                (cursor.lastrowid, event_id, model_id, segment_id),
                             )
-                            row = conn.execute(
-                                "SELECT rowid FROM vec_items WHERE rowid = last_insert_rowid()"
-                            ).fetchone()
-                            if row:
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO vec_items_meta (rowid, event_id, embedding_model_id, segment_id) VALUES (?, ?, ?, ?)",
-                                    (row[0], event_id, model_id, segment_id),
-                                )
-                        except Exception as vec_err:
-                            logger.warning(f"vec0 insert failed for {event_id}: {vec_err}")
+                        # Existing databases can have a different vec0 dimension.
+                        # Preserve them; canonical embeddings remain searchable exactly.
                     stored += 1
                 except Exception as inner:
                     logger.warning(f"Failed to persist embedding for {event_id}: {inner}")
@@ -236,241 +290,98 @@ class EmbeddingIndex:
             return self._search_vec0_multi(query_emb, session_ids=session_ids, segment_id=segment_id, top_k=top_k)
         return self._search_python_multi(query_emb, session_ids=session_ids, segment_id=segment_id, top_k=top_k)
 
-    def _search_vec0_multi(self, query_emb: List[float], session_ids: Optional[List[str]],
-                           segment_id: Optional[str], top_k: Optional[int]) -> List[Dict[str, Any]]:
-        """vec0 KNN with optional multi-session / no-session filter.
-        session_ids=None → cross-session (no session filter).
-        session_ids=[...] → IN-clause filter."""
+    def _valid_embedding(self, embedding):
+        return (isinstance(embedding, (list, tuple)) and len(embedding) == self.embedding_dim
+                and all(isinstance(value, (int, float)) and math.isfinite(value) for value in embedding))
+
+    def _search_vec0_multi(self, query_emb, session_ids, segment_id, top_k):
+        """Exact sqlite-vec cosine over SQL-scoped canonical vectors before top-k.
+
+        Scalar distance has no global KNN candidate limit, so filtering cannot
+        discard the requested session. Python remains the exhaustive oracle.
+        """
+        if not self._vec_available:
+            return self._search_python_multi(query_emb, session_ids, segment_id, top_k)
+        if session_ids == [] or not self._valid_embedding(query_emb) or not any(query_emb):
+            return []
+        if top_k is not None and (not isinstance(top_k, int) or top_k < 0):
+            raise ValueError("top_k must be a non-negative integer or None")
         conn = self._get_connection()
         try:
-            query_bytes = struct.pack(f'{len(query_emb)}f', *query_emb)
-            unlimited = not top_k
-
-            count_sql = "SELECT COUNT(*) FROM vec_items_meta m JOIN events e ON m.event_id=e.id WHERE m.embedding_model_id = ?"
-            count_params: list = [JINA_MODEL]
-            if session_ids:
-                placeholders = ",".join("?" for _ in session_ids)
-                count_sql += f" AND e.session_id IN ({placeholders})"
-                count_params.extend(session_ids)
-
-            if unlimited:
-                row = conn.execute(count_sql, count_params).fetchone()
-                knn_k = max(int(row[0] or 0), 1)
-            else:
-                knn_k = max(top_k * 4, top_k)
-
-            sql = """
-                WITH knn AS (
-                    SELECT rowid, distance
-                    FROM vec_items
-                    WHERE embedding MATCH ? AND k = ?
-                )
-                SELECT m.event_id, m.segment_id, m.embedding_model_id, knn.distance, e.session_id
-                FROM knn
-                JOIN vec_items_meta m ON knn.rowid = m.rowid
-                JOIN events e ON m.event_id = e.id
-                WHERE m.embedding_model_id = ?
-            """
-            params: list = [query_bytes, knn_k, JINA_MODEL]
-            if session_ids:
-                placeholders = ",".join("?" for _ in session_ids)
-                sql += f" AND e.session_id IN ({placeholders})"
+            sql = """SELECT e.id, i.type, i.embedding_model_id, e.segment_id, e.session_id,
+                            1.0 - vec_distance_cosine(i.embedding, ?) AS similarity
+                     FROM embedding_index i JOIN events e ON i.event_id=e.id
+                     WHERE i.embedding_model_id=? AND length(i.embedding)=?
+                       AND similarity IS NOT NULL"""
+            params = [struct.pack(f'{len(query_emb)}f', *query_emb), self.model_id, 4*self.embedding_dim]
+            if session_ids is not None:
+                sql += " AND e.session_id IN (" + ",".join("?" for _ in session_ids) + ")"
                 params.extend(session_ids)
             if segment_id and segment_id != "all":
-                sql += " AND e.segment_id = ?"
+                sql += " AND e.segment_id=?"
                 params.append(segment_id)
-            sql += " ORDER BY knn.distance"
-            if not unlimited:
+            sql += " ORDER BY similarity DESC, e.id DESC"
+            if top_k:
                 sql += " LIMIT ?"
                 params.append(top_k)
-
-            cursor = conn.execute(sql, params)
-            results = []
-            for row in cursor:
-                distance = row[3]
-                similarity = 1.0 / (1.0 + distance)
-                results.append({
-                    "event_id": row[0],
-                    "segment_id": row[1],
-                    "embedding_model_id": row[2],
-                    "similarity": similarity,
-                    "session_id": row[4],
-                })
-            return results
-        except Exception as e:
-            logger.warning(f"vec0 multi-search failed: {e}. Falling back to Python cosine.")
+            return [{"event_id": row[0], "type": row[1], "embedding_model_id": row[2],
+                     "segment_id": row[3], "session_id": row[4], "similarity": row[5]}
+                    for row in conn.execute(sql, params)]
+        except Exception as exc:
+            logger.warning("Scoped sqlite-vec cosine failed; using Python: %s", exc)
             return self._search_python_multi(query_emb, session_ids, segment_id, top_k)
         finally:
             conn.close()
 
     def _search_python_multi(self, query_emb: List[float], session_ids: Optional[List[str]],
                              segment_id: Optional[str], top_k: Optional[int]) -> List[Dict[str, Any]]:
-        """Python cosine fallback for cross-session / multi-session search."""
+        if session_ids == [] or not self._valid_embedding(query_emb):
+            return []
+        if top_k is not None and (not isinstance(top_k, int) or top_k < 0):
+            raise ValueError("top_k must be a non-negative integer or None")
+        query_norm = math.sqrt(sum(x * x for x in query_emb))
+        if not query_norm:
+            return []
         conn = self._get_connection()
         try:
-            base_sql = """
-                SELECT e.id, i.embedding, i.type, i.embedding_model_id, i.segment_id, e.session_id
-                FROM embedding_index i
-                JOIN events e ON i.event_id = e.id
-                WHERE i.embedding_model_id = ?
-            """
-            params: list = [JINA_MODEL]
-            if session_ids:
-                placeholders = ",".join("?" for _ in session_ids)
-                base_sql += f" AND e.session_id IN ({placeholders})"
+            sql = """SELECT e.id, i.embedding, i.type, i.embedding_model_id, e.segment_id, e.session_id
+                     FROM embedding_index i JOIN events e ON i.event_id=e.id
+                     WHERE i.embedding_model_id=?"""
+            params = [self.model_id]
+            if session_ids is not None:
+                sql += " AND e.session_id IN (" + ",".join("?" for _ in session_ids) + ")"
                 params.extend(session_ids)
             if segment_id and segment_id != "all":
-                base_sql += " AND e.segment_id = ?"
+                sql += " AND e.segment_id=?"
                 params.append(segment_id)
 
-            cursor = conn.execute(base_sql, params)
-            results = []
-            query_norm = math.sqrt(sum(x * x for x in query_emb))
-            for row in cursor:
-                event_id, emb_bytes, ev_type, model_id, seg_id, sess_id = row
-                if not emb_bytes:
-                    continue
-                try:
-                    emb_len = len(emb_bytes) // 4
-                    emb = struct.unpack(f'{emb_len}f', emb_bytes)
-                    dot_product = sum(a * b for a, b in zip(query_emb, emb))
-                    emb_norm = math.sqrt(sum(x * x for x in emb))
-                    if emb_norm == 0 or query_norm == 0:
+            def candidates():
+                for event_id, blob, ev_type, model_id, seg_id, sess_id in conn.execute(sql, params):
+                    if not blob or len(blob) != 4 * self.embedding_dim:
                         continue
-                    similarity = dot_product / (emb_norm * query_norm)
-                    results.append({
-                        "event_id": event_id,
-                        "similarity": similarity,
-                        "type": ev_type,
-                        "embedding_model_id": model_id,
-                        "segment_id": seg_id,
-                        "session_id": sess_id,
-                    })
-                except Exception as e:
-                    logger.warning(f"Error processing embedding for {event_id}: {e}")
-            results.sort(key=lambda x: x['similarity'], reverse=True)
-            return results if not top_k else results[:top_k]
-        except Exception as e:
-            logger.error(f"Multi-session search failed: {e}")
+                    emb = struct.unpack(f'{self.embedding_dim}f', blob)
+                    if not all(math.isfinite(x) for x in emb):
+                        continue
+                    norm = math.sqrt(sum(x * x for x in emb))
+                    if not norm:
+                        continue
+                    similarity = sum(a * b for a, b in zip(query_emb, emb)) / (norm * query_norm)
+                    yield {"event_id": event_id, "similarity": similarity, "type": ev_type,
+                           "embedding_model_id": model_id, "segment_id": seg_id, "session_id": sess_id}
+
+            # SQL cursor streams vectors; a finite top_k stores only k candidates.
+            rank = lambda item: (item['similarity'], item['event_id'])
+            if top_k:
+                return heapq.nlargest(top_k, candidates(), key=rank)
+            return sorted(candidates(), key=rank, reverse=True)
+        except Exception as exc:
+            logger.error("Scoped embedding search failed: %s", exc)
             return []
         finally:
             conn.close()
 
-    def _search_vec0(self, query_emb: List[float], session_id: str, segment_id: str = None, top_k: Optional[int] = 20) -> List[Dict[str, Any]]:
-        """Fast KNN search using sqlite-vec. top_k=None/0 → unlimited."""
-        if not self._vec_available:
-            logger.info("_search_vec0: vec not available, falling back to Python")
-            return self._search_python(query_emb, session_id, segment_id, top_k)
-        conn = self._get_connection()
-        try:
-            query_bytes = struct.pack(f'{len(query_emb)}f', *query_emb)
+    def _search_vec0(self, query_emb, session_id, segment_id=None, top_k=20):
+        return self._search_vec0_multi(query_emb, [session_id], segment_id, top_k)
 
-            unlimited = not top_k  # None or 0
-            # vec0 KNN requires `k = ?` directly on the vec_items query.
-            # When unlimited: probe full table size for this session.
-            if unlimited:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM vec_items_meta m JOIN events e ON m.event_id=e.id "
-                    "WHERE e.session_id = ? AND m.embedding_model_id = ?",
-                    (session_id, JINA_MODEL)
-                ).fetchone()
-                knn_k = max(int(row[0] or 0), 1)
-            else:
-                # Over-fetch so post-filter by session/segment leaves enough.
-                knn_k = max(top_k * 4, top_k)
-            use_segment = bool(segment_id and segment_id != "all")
-            sql = """
-                WITH knn AS (
-                    SELECT rowid, distance
-                    FROM vec_items
-                    WHERE embedding MATCH ? AND k = ?
-                )
-                SELECT m.event_id, m.segment_id, m.embedding_model_id, knn.distance
-                FROM knn
-                JOIN vec_items_meta m ON knn.rowid = m.rowid
-                JOIN events e ON m.event_id = e.id
-                WHERE e.session_id = ?
-                  AND m.embedding_model_id = ?
-            """
-            params: list = [query_bytes, knn_k, session_id, JINA_MODEL]
-            if use_segment:
-                sql += " AND e.segment_id = ?"
-                params.append(segment_id)
-            sql += " ORDER BY knn.distance"
-            if not unlimited:
-                sql += " LIMIT ?"
-                params.append(top_k)
-
-            cursor = conn.execute(sql, params)
-            results = []
-            for row in cursor:
-                # Convert distance to similarity (sqlite-vec returns L2 distance)
-                distance = row[3]
-                similarity = 1.0 / (1.0 + distance)  # Convert L2 to similarity
-                results.append({
-                    "event_id": row[0],
-                    "segment_id": row[1],
-                    "embedding_model_id": row[2],
-                    "similarity": similarity
-                })
-            return results
-        except Exception as e:
-            logger.warning(f"vec0 search failed: {e}. Falling back to Python cosine.")
-            return self._search_python(query_emb, session_id, segment_id, top_k)
-        finally:
-            conn.close()
-
-    def _search_python(self, query_emb: List[float], session_id: str, segment_id: str = None, top_k: Optional[int] = 20) -> List[Dict[str, Any]]:
-        """Fallback: Python cosine similarity scan. top_k=None/0 → unlimited."""
-        conn = self._get_connection()
-        try:
-            base_sql = """
-                SELECT e.id, i.embedding, i.type, i.embedding_model_id, i.segment_id
-                FROM embedding_index i
-                JOIN events e ON i.event_id = e.id
-                WHERE e.session_id = ? AND i.embedding_model_id = ?
-            """
-            params: list = [session_id, JINA_MODEL]
-
-            if segment_id and segment_id != "all":
-                base_sql += " AND e.segment_id = ?"
-                params.append(segment_id)
-
-            cursor = conn.execute(base_sql, params)
-
-            results = []
-            query_norm = math.sqrt(sum(x * x for x in query_emb))
-
-            for row in cursor:
-                event_id, emb_bytes, ev_type, model_id, seg_id = row
-                if not emb_bytes:
-                    continue
-
-                try:
-                    emb_len = len(emb_bytes) // 4
-                    emb = struct.unpack(f'{emb_len}f', emb_bytes)
-
-                    dot_product = sum(a * b for a, b in zip(query_emb, emb))
-                    emb_norm = math.sqrt(sum(x * x for x in emb))
-
-                    if emb_norm == 0 or query_norm == 0:
-                        continue
-                    similarity = dot_product / (emb_norm * query_norm)
-
-                    results.append({
-                        "event_id": event_id,
-                        "similarity": similarity,
-                        "type": ev_type,
-                        "embedding_model_id": model_id,
-                        "segment_id": seg_id
-                    })
-                except Exception as e:
-                    logger.warning(f"Error processing embedding for {event_id}: {e}")
-
-            results.sort(key=lambda x: x['similarity'], reverse=True)
-            return results if not top_k else results[:top_k]
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
-            return []
-        finally:
-            conn.close()
+    def _search_python(self, query_emb, session_id, segment_id=None, top_k=20):
+        return self._search_python_multi(query_emb, [session_id], segment_id, top_k)

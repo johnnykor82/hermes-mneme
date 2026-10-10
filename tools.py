@@ -75,7 +75,8 @@ class ContextTools:
                             "description": (
                                 "'current' = active session segment (fast, narrow). "
                                 "'all' = search across all topic segments. "
-                                "Or a specific segment_id."
+                                "Or a specific segment_id. Use 'all' with session='all' "
+                                "or multiple session ids."
                             ),
                         },
                         "session": {
@@ -307,10 +308,34 @@ class ContextTools:
         # None contract before crossing the indexer boundary — historically
         # `'all'` was passed through as a literal string and only worked
         # because every indexer SQL path special-cased it).
-        if segment in ("current", "all"):
+        if segment == "current":
+            if session == "all" or isinstance(session, list) and len(session) != 1:
+                return json.dumps({"error": "segment='current' requires one session; use segment='all' for cross-session search"})
+            target_session = session_id if session == "current" else (session[0] if isinstance(session, list) else session)
+            if self.engine is not None and self.engine.session_id == target_session:
+                search_segment = self.engine.current_segment_id
+            else:
+                state = self.store.load_state(target_session) or {}
+                search_segment = state.get("segment_id")
+                if not search_segment:
+                    conn = self.store._get_connection()
+                    try:
+                        row = conn.execute(
+                            "SELECT segment_id FROM events WHERE session_id = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+                            (target_session,),
+                        ).fetchone()
+                        search_segment = row["segment_id"] if row else None
+                    finally:
+                        conn.close()
+            if not search_segment:
+                return json.dumps({"error": "No current segment is available for this session"})
+        elif segment == "all":
             search_segment = None  # no segment filter
         else:
             search_segment = segment
+
+        if cross_session and search_segment is not None:
+            return json.dumps({"error": "session='all' requires segment='all'; select a session for a specific segment"})
 
         try:
             if cross_session:

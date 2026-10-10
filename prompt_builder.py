@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 STATE_CAP_TOKENS = 1000  # Execution state hard cap (Component 3, spec override)
 
 
+class PromptBudgetExceeded(ValueError):
+    """Mandatory request content cannot fit the configured token estimate."""
+
+    def __init__(self, actual_tokens: int, budget_tokens: int):
+        self.actual_tokens = actual_tokens
+        self.budget_tokens = budget_tokens
+        super().__init__(f"Prompt token budget exceeded: {actual_tokens}/{budget_tokens}")
+
+
 class PromptBuilder:
     """Assembles the final structured context passed to the LLM.
 
@@ -53,6 +62,32 @@ class PromptBuilder:
     def set_system_prompt_tokens(self, count: int):
         """Cache actual system prompt token count (called once at session start)."""
         self.system_prompt_tokens = count
+
+    def count_message_tokens(self, message: Dict[str, Any]) -> int:
+        """Count content, message framing and fields such as tool calls."""
+        extras = {key: value for key, value in message.items() if key not in ("role", "content")}
+        return (self.tokenizer(str(message.get("content", "") or "")) + 4
+                + (self.tokenizer(json.dumps(extras, ensure_ascii=False)) if extras else 0))
+
+    @staticmethod
+    def _message_groups(messages):
+        """Keep an assistant tool-call message and its outputs indivisible."""
+        groups = []
+        for message in messages:
+            if (message.get("role") == "tool" and groups
+                    and groups[-1][0].get("role") == "assistant"
+                    and groups[-1][0].get("tool_calls")):
+                groups[-1].append(message)
+            else:
+                groups.append([message])
+        return groups
+
+    def _drop_oldest_tail_group(self, messages, protected_message=None):
+        group = self._message_groups(messages)[0] if messages else []
+        if len(messages) - len(group) < 2 or any(m is protected_message for m in group):
+            return []
+        del messages[:len(group)]
+        return group
 
     def build(
         self,
@@ -177,22 +212,31 @@ class PromptBuilder:
         ):
             recent_messages = recent_messages[:-1]
         floor_n = self.protected_tail_turns
-        if len(recent_messages) > floor_n:
-            tail_messages = list(recent_messages[-floor_n:])
-            extendable_messages = list(recent_messages[:-floor_n])
-        else:
-            tail_messages = list(recent_messages)
-            extendable_messages = []
-        tail_tokens = sum(self.tokenizer(str(m.get("content", ""))) + 4 for m in tail_messages)
+        groups = self._message_groups(recent_messages)
+        # On tool continuations the current user request is already in the
+        # history, rather than appended. Keep that actual message mandatory.
+        protected_user = None
+        if not append_current_user_message and current_user_message:
+            protected_user = next((m for m in reversed(recent_messages)
+                                   if m.get("role") == "user" and
+                                   str(m.get("content", "")).strip() == str(current_user_message).strip()), None)
+        tail_messages = []
+        while groups and (len(tail_messages) < floor_n or
+                          protected_user is not None and not any(m is protected_user for m in tail_messages)):
+            tail_messages[:0] = groups.pop()
+        extendable_groups = groups
+        tail_tokens = sum(self.count_message_tokens(m) for m in tail_messages)
 
         # If the floor itself blows past tail_budget AND we have more than 2
         # turns, drop oldest down to tail_budget (spec rule: never below 2).
         if tail_tokens > tail_budget and len(tail_messages) > 2:
             dropped = 0
             while len(tail_messages) > 2 and tail_tokens > tail_budget:
-                removed = tail_messages.pop(0)
-                tail_tokens -= self.tokenizer(str(removed.get("content", ""))) + 4
-                dropped += 1
+                removed = self._drop_oldest_tail_group(tail_messages, protected_user)
+                if not removed:
+                    break
+                tail_tokens -= sum(self.count_message_tokens(m) for m in removed)
+                dropped += len(removed)
             logger.info(
                 f"tail floor over tail_budget: dropped {dropped} oldest "
                 f"(tail_tokens={tail_tokens}, tail_budget={tail_budget})"
@@ -216,15 +260,15 @@ class PromptBuilder:
         SAFETY_MARGIN = 256
         used = state_tokens + retrieved_tokens_used + tail_tokens + current_msg_tokens
         added_back = 0
-        while extendable_messages:
-            candidate = extendable_messages[-1]
-            cost = self.tokenizer(str(candidate.get("content", ""))) + 4
+        while extendable_groups:
+            candidate = extendable_groups[-1]
+            cost = sum(self.count_message_tokens(m) for m in candidate)
             if used + cost > effective_budget - SAFETY_MARGIN:
                 break
-            tail_messages.insert(0, extendable_messages.pop())
+            tail_messages[:0] = extendable_groups.pop()
             tail_tokens += cost
             used += cost
-            added_back += 1
+            added_back += len(candidate)
         if added_back:
             logger.info(
                 f"Tail extended by {added_back} older turns to fill headroom "
@@ -244,14 +288,16 @@ class PromptBuilder:
 
             # Step 2: Truncate protected tail (keep most recent, min 2 turns)
             while len(tail_messages) > 2 and (state_tokens + retrieved_tokens_used + tail_tokens + current_msg_tokens) > effective_budget:
-                removed = tail_messages.pop(0)
-                tail_tokens -= self.tokenizer(str(removed.get("content", ""))) + 4
+                removed = self._drop_oldest_tail_group(tail_messages, protected_user)
+                if not removed:
+                    break
+                tail_tokens -= sum(self.count_message_tokens(m) for m in removed)
 
-            # Step 3: If still over budget, log critical and return minimal
+            # Keep mandatory content for the final assembled-request check,
+            # which raises an explicit overflow instead of returning it silently.
             total_used = state_tokens + retrieved_tokens_used + tail_tokens + current_msg_tokens
             if total_used > effective_budget:
                 logger.critical(f"Budget still exceeded after resolution: {total_used}/{effective_budget}")
-                tail_messages = tail_messages[-2:] if len(tail_messages) >= 2 else tail_messages
                 retrieved_chunks_text = []
 
         # 6. Assemble output
@@ -304,9 +350,27 @@ class PromptBuilder:
         if append_current_user_message and current_user_message:
             final_messages.append({"role": "user", "content": current_user_message})
 
-        final_total = self.tokenizer(system_content) + sum(
-            self.tokenizer(str(m.get("content", ""))) + 4 for m in final_messages[1:]
-        )
+        # Allocation above is a sizing hint. Enforce the limit again on the
+        # actual assembled request, including wrappers, hints and tool fields.
+        # The cached system count can include external tool schemas; reserve
+        # only the part not already present as the original system prompt.
+        reserved_tokens = max(0, self.system_prompt_tokens - (
+            self.tokenizer(system_prompt_override) if system_prompt_override else 0
+        ))
+        final_total = reserved_tokens + sum(self.count_message_tokens(m) for m in final_messages)
+        if final_total > self.total_budget and retrieved_chunks_text:
+            index = 1 + len(request_prefix or [])
+            removed = final_messages.pop(index)
+            final_total -= self.count_message_tokens(removed)
+        tail_index = 1 + len(request_prefix or [])
+        while final_total > self.total_budget and len(tail_messages) > 2:
+            removed = self._drop_oldest_tail_group(tail_messages, protected_user)
+            if not removed:
+                break
+            del final_messages[tail_index:tail_index + len(removed)]
+            final_total -= sum(self.count_message_tokens(m) for m in removed)
+        if final_total > self.total_budget:
+            raise PromptBudgetExceeded(final_total, self.total_budget)
         logger.info(f"Prompt built. Total tokens: {final_total}/{self.total_budget}")
 
         return final_messages

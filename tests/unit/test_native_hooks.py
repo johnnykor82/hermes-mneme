@@ -22,6 +22,8 @@ def _engine(tmp_path, *, budget=100_000):
         db_path=str(tmp_path / "plugin.db"),
         config=cfg,
     )
+    eng.indexer.get_embedding = lambda text: None
+    eng.indexer.get_embeddings_batch = lambda texts: [None] * len(texts)
     eng.on_session_start("native-session")
     return eng
 
@@ -106,7 +108,8 @@ def test_select_context_ingests_current_user_without_replacing_small_request(tmp
 
 
 def test_select_context_returns_request_only_context_when_assembly_needed(tmp_path):
-    eng = _engine(tmp_path, budget=80)
+    eng = _engine(tmp_path, budget=1000)
+    eng._resume_context_fill_pending = True
     try:
         conversation = [
             {"role": "user", "content": "alpha " * 200},
@@ -118,7 +121,7 @@ def test_select_context_returns_request_only_context_when_assembly_needed(tmp_pa
             list(conversation),
             conversation_messages=list(conversation),
             incoming_message=conversation[-1],
-            budget_tokens=80,
+            budget_tokens=1000,
             session_id="native-session",
         )
 
@@ -134,7 +137,8 @@ def test_select_context_returns_request_only_context_when_assembly_needed(tmp_pa
 
 
 def test_select_context_preserves_request_system_prompt_without_ingesting_it(tmp_path):
-    eng = _engine(tmp_path, budget=80)
+    eng = _engine(tmp_path, budget=1000)
+    eng._resume_context_fill_pending = True
     try:
         system_text = "ORIGINAL HERMES SYSTEM PROMPT"
         conversation = [
@@ -148,7 +152,7 @@ def test_select_context_preserves_request_system_prompt_without_ingesting_it(tmp
             request,
             conversation_messages=list(conversation),
             incoming_message=conversation[-1],
-            budget_tokens=80,
+            budget_tokens=1000,
             session_id="native-session",
         )
 
@@ -172,7 +176,8 @@ def test_select_context_preserves_request_system_prompt_without_ingesting_it(tmp
 
 
 def test_select_context_does_not_reappend_user_after_tool_outputs(tmp_path):
-    eng = _engine(tmp_path, budget=120)
+    eng = _engine(tmp_path, budget=1000)
+    eng._resume_context_fill_pending = True
     try:
         search_prompt = (
             'Сделай context_search отдельно по трём запросам: '
@@ -210,7 +215,7 @@ def test_select_context_does_not_reappend_user_after_tool_outputs(tmp_path):
             list(conversation),
             conversation_messages=list(conversation),
             incoming_message=conversation[-1],
-            budget_tokens=120,
+            budget_tokens=1000,
             session_id="native-session",
         )
 
@@ -222,7 +227,8 @@ def test_select_context_does_not_reappend_user_after_tool_outputs(tmp_path):
 
 
 def test_select_context_preserves_ephemeral_prefill_without_ingesting_it(tmp_path):
-    eng = _engine(tmp_path, budget=80)
+    eng = _engine(tmp_path, budget=1000)
+    eng._resume_context_fill_pending = True
     try:
         conversation = [
             {"role": "user", "content": "alpha " * 200},
