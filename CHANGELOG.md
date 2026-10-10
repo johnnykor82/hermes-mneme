@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-10-10
+
+### Fixed
+- Recognize retained legacy history after resume even when provider call IDs were not stored, mixed assistant text was omitted, or compaction reordered the retained transcript. Matching consumes distinct historical occurrences within the active session and excludes explicitly new user input.
+- Preserve repeated new input at reused transcript positions after compression, and distinguish tool calls with identical payloads but different provider IDs.
+- Restore the provider-ID alias of an unfinished legacy tool call during replay so its eventual output keeps the original graph edge.
+- Recognize Hermes's historical pruned-tool placeholder through the original call ID or a matched legacy graph edge, retaining the full stored result instead of duplicating it.
+- Clarify the tool description for searching earlier topics in the same session, where `segment='all'` must be explicit.
+- Report invalid search limits using the public `k` parameter and reject the unsupported `top_k` name instead of silently using the default limit.
+- Export native context-tool argument schemas as OpenAI-compatible `parameters`, so Hermes and the provider receive the declared types and required fields.
+- Repair malformed Mneme schemas retained in Hermes session tool pins before resume restores them; preserve the pin version, tool order, unrelated schemas and message history.
+
+### Validation
+- Added regressions for legacy transcript gaps, reordered/backfilled history, pruned tool results, distinct tool-call identities, compression boundaries and repeated native-hook requests.
+- Existing event IDs and historical graph records are preserved. Legacy records without call IDs use occurrence matching; indistinguishable historical occurrences cannot be reconstructed exactly.
+
 ## [0.5.1] - 2026-10-10
 
 ### Fixed

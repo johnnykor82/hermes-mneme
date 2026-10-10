@@ -1,6 +1,12 @@
 # Explicit legacy segment migration
 
-The plugin never runs this migration automatically. `scripts/migrate_legacy_segments.py` defaults to a read-only dry-run and imports neither `ContextStore` nor the engine. It repairs only legacy `seg_1` session collisions. It does not reconstruct historical topic boundaries.
+## Hermes session tool pins in 0.5.2
+
+Back up Hermes `state.db` through SQLite's backup API as well as Mneme `plugin.db` before upgrading. Hermes stores frozen tool definitions in session tool pins in `state.db`; a plugin upgrade alone does not invalidate those pins when the Hermes version is unchanged.
+
+On session binding, Mneme repairs only its seven native tool descriptors that retain an old `input_schema` with absent or minimal empty `parameters`. The original stored argument schema moves to `parameters`; the pin version, tool order, other descriptors and message history remain unchanged. Correct schemas and legacy name-only pins are untouched. Repeated binding is a no-op after repair. Restore the pre-upgrade `state.db` backup with all writers stopped if the previous pin bytes are needed for rollback.
+
+The plugin never runs the legacy segment migration automatically. `scripts/migrate_legacy_segments.py` defaults to a read-only dry-run and imports neither `ContextStore` nor the engine. It repairs only legacy `seg_1` session collisions. It does not reconstruct historical topic boundaries.
 
 Use the Hermes Python environment with `sqlite-vec` installed. The extension is loaded on every source, backup and verification connection when available; a vec0 database is refused if the extension is unavailable.
 
@@ -18,6 +24,14 @@ For each session independently, migration maps `seg_1` to `seg_<session_id>_1`. 
 Event scope/time indexes are created before the first per-session update to prevent repeated full-history scans. All updates, required event scope/time indexes and the `mneme_migrations` record commit in one transaction. The report includes `EXPLAIN QUERY PLAN` for the scoped centroid query. Any exception rolls the entire migration back; the valid pre-migration backup remains. A second run with no legacy rows is a no-op.
 
 The JSON report includes per-session targets and affected rows; before/after counts; streaming event digest excluding only `segment_id`; graph/lineage digests; authoritative embedding BLOB and vector metadata digests excluding only segment IDs; canonical execution-state digest excluding only root segment ID; `PRAGMA integrity_check`; orphan embeddings, vector metadata, vec0 rowids and graph endpoints. Apply refuses a failing integrity check and refuses any change in protected digests/counts/orphan counts. Existing orphan counts are reported, not repaired; an unrelated existing orphan is not attributed to this migration. Reports contain session IDs, so keep them private.
+
+## Upgrading from 0.5.1
+
+Upgrading from 0.5.1 to 0.5.2 requires no additional segment migration. Keep existing backups. The resume fix preserves old event IDs and graph rows; retained text that an older parser omitted can be recovered on resume. It prevents new replay duplicates but does not delete historical duplicate rows. Where old call IDs are absent and repeated content is indistinguishable, matching consumes separate historical occurrences rather than reconstructing the original provider identity.
+
+Hermes may replace old tool results in its active transcript with `[Old tool output cleared to save context space]`. During retained-history replay, 0.5.2 recognizes that exact placeholder only through an existing provider call ID or an already matched historical call and its graph edge. The complete stored result remains unchanged; an unrelated call cannot reuse it merely because its placeholder text is identical.
+
+If an already matched historical call has no recoverable output identity because its legacy graph is incomplete, the host's placeholder derivative is skipped without inventing an event ID or graph edge. Historical payloads remain intact. This prevents new duplicates; it does not repair missing historical graph relationships or recover outputs that were never stored.
 
 ## Restore
 
