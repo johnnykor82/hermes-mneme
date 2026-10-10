@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from functools import wraps
 from typing import Dict, List, Any, Optional
 
@@ -110,6 +111,8 @@ class CustomRouterContextEngine(ContextEngine):
         super().__init__()
         self._lifecycle_lock = threading.RLock()
         self._replay_pending = False
+        self._resume_replay_pending = False
+        self._event_id_nonce = None
         self.session_id = None
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
@@ -279,7 +282,9 @@ class CustomRouterContextEngine(ContextEngine):
 
     def _existing_replay_id(self, event, msg_index, sub_index, lineage):
         """Recognize deterministic IDs created before a compression rebind."""
-        candidates = [self.store.make_event_id(sid, msg_index, event["role"],
+        candidates = [self.store.make_event_id(
+                      f"{sid}:{self._event_id_nonce}" if self._event_id_nonce else sid,
+                      msg_index, event["role"],
                       event["content"], sub_index) for sid in lineage]
         return self.store.existing_event_id(candidates, self.session_id)
 
@@ -633,6 +638,8 @@ class CustomRouterContextEngine(ContextEngine):
             self._last_enrichment_turn = turn
         try:
             if self.session_id:
+                if self._event_id_nonce:
+                    self._current_state["_event_id_nonce"] = self._event_id_nonce
                 self.store.commit_state(self.session_id, self._current_state)
         except Exception as e:
             logger.warning(f"Enricher: commit_state after merge failed: {e}")
@@ -853,6 +860,11 @@ class CustomRouterContextEngine(ContextEngine):
         source_messages = conversation_messages if conversation_messages is not None else request_messages
         if not source_messages:
             return None
+        new_user_input = (
+            isinstance(incoming_message, dict)
+            and incoming_message.get("role") == "user"
+            and source_messages[-1] == incoming_message
+        )
         request_system_prompt = None
         for msg in request_messages or []:
             if (msg or {}).get("role") == "system":
@@ -872,6 +884,7 @@ class CustomRouterContextEngine(ContextEngine):
                 caller=caller,
                 system_prompt_override=request_system_prompt,
                 request_tail=request_tail,
+                new_user_input=new_user_input,
             )
         except prompt_builder.PromptBudgetExceeded as exc:
             self._last_budget_overflow = {"actual_tokens": exc.actual_tokens,
@@ -911,6 +924,7 @@ class CustomRouterContextEngine(ContextEngine):
         caller: str = "context_cycle",
         system_prompt_override: Optional[str] = None,
         request_tail: Optional[List[Dict[str, Any]]] = None,
+        new_user_input: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Shared context pipeline.
@@ -963,6 +977,9 @@ class CustomRouterContextEngine(ContextEngine):
                 logger.warning(f"compress: session_exists check failed: {e}")
 
             if existing_status is not None and existing_status == "active":
+                self._replay_pending = True
+                self._resume_replay_pending = True
+                self._event_id_nonce = None
                 logger.info(
                     f"compress: session drift detected (RESUME). plugin={previous!r} "
                     f"hermes={hermes_sid!r} status={existing_status!r} — rejoining existing session."
@@ -1003,6 +1020,7 @@ class CustomRouterContextEngine(ContextEngine):
                     self._current_state = recovered or self._make_default_state(
                         hermes_sid, self.current_segment_id
                     )
+                self._event_id_nonce = self._current_state.get("_event_id_nonce")
                 self._processed_msg_count = 0
                 self._binding_origin_idx = 0
                 self._last_enrichment_turn = -1
@@ -1189,8 +1207,23 @@ class CustomRouterContextEngine(ContextEngine):
             segment_changed_this_turn = False
             pending_embeddings: List[tuple] = []
             lineage = self.store.get_lineage_chain(self.session_id)
-            replay_ids = self._match_replay_prefix(new_messages, base_idx) if self._replay_pending else {}
-            self._replay_pending = False
+            replay_messages = new_messages
+            if self._resume_replay_pending and new_user_input:
+                # The explicitly incoming last user is a new turn even if
+                # its text matches an older event at this buffer position.
+                replay_messages = new_messages[:-1]
+            replay_ids = self._match_replay_prefix(replay_messages, base_idx) if self._replay_pending else {}
+            if new_messages and self._resume_replay_pending:
+                # Retained prefixes may have shifted positions after a
+                # restart, so new events in this buffer need their own
+                # identity namespace. Legacy replay without the explicit
+                # incoming-user signal keeps its saved namespace.
+                if new_user_input:
+                    self._event_id_nonce = uuid.uuid4().hex
+                    self._current_state["_event_id_nonce"] = self._event_id_nonce
+                self._resume_replay_pending = False
+            if new_messages:
+                self._replay_pending = False
             if new_messages:
                 logger.info(f"Processing {len(new_messages)} new messages")
                 for offset, msg in enumerate(new_messages):
@@ -1213,7 +1246,8 @@ class CustomRouterContextEngine(ContextEngine):
                     events_data = parser.parse_message_to_event(msg, self.session_id, self.current_segment_id)
                     for sub_idx, ev in enumerate(events_data):
                         det_id = self.store.make_event_id(
-                            ev["session_id"], msg_idx, ev["role"], ev["content"], sub_idx
+                            f"{ev['session_id']}:{self._event_id_nonce}" if self._event_id_nonce else ev["session_id"],
+                            msg_idx, ev["role"], ev["content"], sub_idx
                         )
                         existing_id = replay_ids.get((msg_idx, sub_idx)) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage)
                         if existing_id:
@@ -1275,6 +1309,8 @@ class CustomRouterContextEngine(ContextEngine):
             # atomically in one transaction so they cannot diverge on crash).
             # Done BEFORE the pass-through guard so ingest mutations survive
             # a pass-through return.
+            if self._event_id_nonce:
+                self._current_state["_event_id_nonce"] = self._event_id_nonce
             self.store.commit_state(self.session_id, self._current_state)
 
         if not assemble:
@@ -1737,6 +1773,7 @@ class CustomRouterContextEngine(ContextEngine):
         """
         self._native_request_cache = None
         self._replay_pending = True
+        self._resume_replay_pending = False
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self.session_id
@@ -1819,6 +1856,8 @@ class CustomRouterContextEngine(ContextEngine):
 
         if existing_status is not None:
             # RESUME path: rejoin the existing session.
+            self._resume_replay_pending = True
+            self._event_id_nonce = None
             self.session_id = session_id
             try:
                 self.store.reactivate_session(session_id)
@@ -1854,6 +1893,7 @@ class CustomRouterContextEngine(ContextEngine):
                 else:
                     self._current_state = self._make_default_state(session_id, self.current_segment_id)
                     state_source = "default"
+            self._event_id_nonce = self._current_state.get("_event_id_nonce")
             # The whole `messages` buffer Hermes will pass next is legitimate
             # tail; ingest from index 0 with deterministic IDs (dedupes on
             # re-write).
@@ -1882,6 +1922,7 @@ class CustomRouterContextEngine(ContextEngine):
             return
 
         self.session_id = session_id
+        self._event_id_nonce = None
         # Lazy session row (A0): no INSERT into `sessions` here — the row is
         # materialized inside add_event() when a real event arrives. This
         # prevents phantom sessions when the process dies before the first
@@ -1933,6 +1974,8 @@ class CustomRouterContextEngine(ContextEngine):
         hook does for fresh sessions.
         """
         self._native_request_cache = None
+        self._resume_replay_pending = False
+        self._event_id_nonce = None
         super().on_session_reset()
         previous = self.session_id
         logger.info(f"on_session_reset: clearing in-memory binding (was session_id={previous!r})")
