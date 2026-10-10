@@ -136,6 +136,157 @@ def test_resume_retained_transcript_does_not_duplicate(eng):
     assert eng.store.count_events('A') == 2
 
 
+def _tool_history():
+    return [
+        {'role': 'user', 'content': 'inspect the project'},
+        {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'call-old', 'type': 'function', 'function': {'name': 'inspect', 'arguments': '{}'}}]},
+        {'role': 'tool', 'content': 'project details', 'tool_call_id': 'call-old'},
+        {'role': 'assistant', 'content': 'inspection complete'},
+    ]
+
+
+def test_resume_shifted_legacy_null_tool_ids_preserves_new_user(eng):
+    eng.on_session_start('A')
+    earlier = [{'role': 'user', 'content': 'earlier'}, {'role': 'assistant', 'content': 'earlier answer'}]
+    retained = _tool_history()
+    eng.on_turn_complete(earlier + retained)
+    conn = eng.store._get_connection()
+    conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
+    conn.commit()
+    conn.close()
+    eng.on_session_start('A')
+    incoming = retained[0].copy()
+    eng.select_context(retained + [incoming], conversation_messages=retained + [incoming], incoming_message=incoming)
+    eng.on_turn_complete(retained + [incoming, {'role': 'assistant', 'content': 'new answer'}])
+    assert eng.store.count_events('A') == 8
+    assert eng.store.load_state('A')['turn_count'] == 3
+
+
+def test_replay_prefix_keeps_distinct_non_null_tool_ids(eng):
+    eng.on_session_start('A')
+    history = _tool_history()
+    eng.on_turn_complete(history)
+    different = copy.deepcopy(history)
+    different[1]['tool_calls'][0]['id'] = 'call-different'
+    different[2]['tool_call_id'] = 'call-different'
+    matched = eng._match_replay_prefix(different, 0)
+    assert (1, 0) not in matched
+    assert (2, 0) not in matched
+
+
+def test_resume_legacy_mixed_text_and_duplicate_rows_align(eng):
+    eng.on_session_start('A')
+    retained = _tool_history()
+    eng.on_turn_complete(retained)
+    conn = eng.store._get_connection()
+    conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
+    call = conn.execute("SELECT * FROM events WHERE type='tool_call'").fetchone()
+    conn.execute("INSERT INTO events(id,session_id,segment_id,timestamp,type,role,content) VALUES(?,?,?,?,?,?,?)",
+                 ('legacy-duplicate', 'A', call['segment_id'], call['timestamp'], 'tool_call', 'assistant', call['content']))
+    conn.commit()
+    conn.close()
+    before = eng.store.count_events('A')
+    replay = copy.deepcopy(retained)
+    replay[1]['content'] = 'I will inspect the project now.'
+    eng.on_session_start('A')
+    incoming = replay[0].copy()
+    eng.select_context(replay + [incoming], conversation_messages=replay + [incoming], incoming_message=incoming)
+    full = replay + [incoming, {'role': 'assistant', 'content': 'new answer'}]
+    eng.on_turn_complete(full)
+    assert eng.store.count_events('A') == before + 3  # missing legacy text + new user/answer
+    eng.select_context(full + [incoming], conversation_messages=full + [incoming], incoming_message=incoming)
+    eng.on_turn_complete(full + [incoming, {'role': 'assistant', 'content': 'another new answer'}])
+    assert eng.store.count_events('A') == before + 5
+
+
+def test_compression_identical_incoming_user_survives_api_retries(eng):
+    incoming = {'role': 'user', 'content': 'repeat request'}
+    eng.on_session_start('A')
+    eng.on_turn_complete([incoming, {'role': 'assistant', 'content': 'old answer'},
+                          {'role': 'user', 'content': 'different request'},
+                          {'role': 'assistant', 'content': 'another answer'}])
+    eng.on_session_start('B', boundary_reason='compression', old_session_id='A')
+    eng.select_context([incoming], conversation_messages=[incoming], incoming_message=incoming)
+    assert eng.store.count_events('B') == 5
+    assert eng.store.load_state('B')['turn_count'] == 3
+    nonce = eng._event_id_nonce
+    # Same request cache and a changed system-prefix cache miss both retry the same turn.
+    eng.select_context([incoming], conversation_messages=[incoming], incoming_message=incoming)
+    eng.select_context([{'role': 'system', 'content': 'retry prefix'}, incoming],
+                       conversation_messages=[incoming], incoming_message=incoming)
+    assert eng.store.count_events('B') == 5
+    assert eng._event_id_nonce == nonce
+    eng.on_turn_complete([incoming, {'role': 'assistant', 'content': 'new answer'}])
+    eng.on_turn_complete([incoming, {'role': 'assistant', 'content': 'new answer'}])
+    assert eng.store.count_events('B') == 6
+
+
+def test_resume_same_tool_content_distinct_known_ids_preserves_graph(eng):
+    eng.on_session_start('A')
+    first = _tool_history()
+    second = copy.deepcopy(first)
+    second[1]['tool_calls'][0]['id'] = 'call-second'
+    second[2]['tool_call_id'] = 'call-second'
+    eng.on_turn_complete(first + [{'role': 'user', 'content': 'separator'},
+                                  {'role': 'assistant', 'content': 'separator answer'}] + second)
+    before = eng.store.count_events('A')
+    eng.on_session_start('A')
+    conn = eng.store._get_connection()
+    second_call_id = conn.execute("SELECT id FROM events WHERE type='tool_call' AND tool_call_id='call-second'").fetchone()[0]
+    conn.close()
+    assert eng._match_replay_prefix(second, 0).get((1, 0)) == second_call_id
+    eng.on_turn_complete(second)
+    assert eng.store.count_events('A') == before
+    conn = eng.store._get_connection()
+    pairs = conn.execute("SELECT a.tool_call_id,z.tool_call_id FROM execution_graph g "
+                         "JOIN events a ON a.id=g.from_event_id JOIN events z ON z.id=g.to_event_id "
+                         "WHERE g.edge_type='tool_output'").fetchall()
+    assert {(r[0], r[1]) for r in pairs} == {('call-old', 'call-old'), ('call-second', 'call-second')}
+    conn.close()
+
+
+def test_legacy_completion_distinct_known_calls_at_same_position(eng):
+    eng.on_session_start('A')
+    first = _tool_history()
+    eng.on_turn_complete(first)
+    second = copy.deepcopy(first)
+    second[1]['tool_calls'][0]['id'] = 'call-second'
+    second[2]['tool_call_id'] = 'call-second'
+    eng.on_session_start('A')
+    eng.on_turn_complete(second)
+    assert eng.store.count_events('A') == 6
+    conn = eng.store._get_connection()
+    pairs = conn.execute("SELECT a.tool_call_id,z.tool_call_id FROM execution_graph g "
+                         "JOIN events a ON a.id=g.from_event_id JOIN events z ON z.id=g.to_event_id "
+                         "WHERE g.edge_type='tool_output'").fetchall()
+    assert {(r[0], r[1]) for r in pairs} == {('call-old', 'call-old'), ('call-second', 'call-second')}
+    conn.close()
+
+
+def test_resume_pending_legacy_call_restores_provider_alias(eng):
+    eng.on_session_start('A')
+    history = _tool_history()
+    eng.on_turn_complete(history[:2])
+    conn = eng.store._get_connection()
+    conn.execute("UPDATE events SET tool_call_id=NULL WHERE type='tool_call'")
+    conn.commit()
+    old_call_id = conn.execute("SELECT id FROM events WHERE type='tool_call'").fetchone()[0]
+    conn.close()
+    eng._pending_tool_calls = {}
+    eng._legacy_tool_calls = []
+    eng._graph_session_id = None
+    eng.on_session_start('A')
+    eng.on_turn_complete(history[:3])
+    assert eng.store.count_events('A') == 3
+    conn = eng.store._get_connection()
+    edges = conn.execute("SELECT g.from_event_id,z.tool_call_id FROM execution_graph g "
+                         "JOIN events z ON z.id=g.to_event_id WHERE g.edge_type='tool_output'").fetchall()
+    assert [(r[0], r[1]) for r in edges] == [(old_call_id, 'call-old')]
+    assert eng._legacy_tool_calls == []
+    conn.close()
+
+
 def test_resume_legacy_pending_user_keeps_replay_identity(eng):
     eng.on_session_start('A')
     messages = [{'role': 'user', 'content': 'unfinished request'}]

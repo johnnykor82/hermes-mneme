@@ -19,6 +19,10 @@ Event scope/time indexes are created before the first per-session update to prev
 
 The JSON report includes per-session targets and affected rows; before/after counts; streaming event digest excluding only `segment_id`; graph/lineage digests; authoritative embedding BLOB and vector metadata digests excluding only segment IDs; canonical execution-state digest excluding only root segment ID; `PRAGMA integrity_check`; orphan embeddings, vector metadata, vec0 rowids and graph endpoints. Apply refuses a failing integrity check and refuses any change in protected digests/counts/orphan counts. Existing orphan counts are reported, not repaired; an unrelated existing orphan is not attributed to this migration. Reports contain session IDs, so keep them private.
 
+## Upgrading from 0.5.1
+
+Upgrading from 0.5.1 to 0.5.2 requires no additional segment migration. Keep existing backups. The resume fix preserves old event IDs and graph rows; retained text that an older parser omitted can be recovered on resume. It prevents new replay duplicates but does not delete historical duplicate rows. Where old call IDs are absent and repeated content is indistinguishable, matching is chronological rather than a reconstruction of the original provider identity.
+
 ## Restore
 
 Stop Gateway and every database writer. Preserve the failed/current database and its WAL/SHM as a separate incident snapshot. Restore the named backup to a **new database path**, verify it with this utility's read-only dry-run, then point the plugin at that restored path and restart Gateway. Using a new path prevents stale WAL/SHM files from being accidentally paired with the backup. Never overwrite a live SQLite database.

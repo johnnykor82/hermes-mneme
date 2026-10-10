@@ -5,6 +5,7 @@ import os
 import threading
 import uuid
 from functools import wraps
+from bisect import bisect_right
 from typing import Dict, List, Any, Optional
 
 MEMORY_ACCESS_HINT_SHORT = """[MEMORY ACCESS]
@@ -282,11 +283,26 @@ class CustomRouterContextEngine(ContextEngine):
 
     def _existing_replay_id(self, event, msg_index, sub_index, lineage):
         """Recognize deterministic IDs created before a compression rebind."""
-        candidates = [self.store.make_event_id(
-                      f"{sid}:{self._event_id_nonce}" if self._event_id_nonce else sid,
-                      msg_index, event["role"],
-                      event["content"], sub_index) for sid in lineage]
-        return self.store.existing_event_id(candidates, self.session_id)
+        candidates = []
+        for sid in lineage:
+            identity = f"{sid}:{self._event_id_nonce}" if self._event_id_nonce else sid
+            if event.get("tool_call_id"):
+                candidates.append(self.store.make_event_id(
+                    f"{identity}:call:{event['tool_call_id']}", msg_index,
+                    event["role"], event["content"], sub_index))
+            candidates.append(self.store.make_event_id(
+                identity, msg_index, event["role"], event["content"], sub_index))
+        conn = self.store._get_connection()
+        try:
+            for event_id in candidates:
+                row = conn.execute("SELECT type,tool_call_id FROM events WHERE id=? AND session_id=?",
+                                   (event_id, self.session_id)).fetchone()
+                if row and row["type"] == event["type"] and (
+                        row["tool_call_id"] is None or row["tool_call_id"] == event.get("tool_call_id")):
+                    return event_id
+            return None
+        finally:
+            conn.close()
 
     def _match_replay_prefix(self, messages, base_idx):
         """Match retained transcript prefixes even after their positions shift.
@@ -301,30 +317,34 @@ class CustomRouterContextEngine(ContextEngine):
                 flat.append(((base_idx + offset, sub_index), event))
         if not flat:
             return {}
-        first = flat[0][1]
         conn = self.store._get_connection()
-        best = {}
         try:
-            starts = conn.execute(
-                "SELECT timestamp,id FROM events WHERE session_id=? AND role=? "
-                "AND type=? AND content=? ORDER BY timestamp DESC,id DESC",
-                (self.session_id, first["role"], first["type"], first["content"]))
-            for start in starts:
-                rows = conn.execute(
-                    "SELECT id,role,type,content,tool_call_id FROM events WHERE session_id=? "
-                    "AND (timestamp>? OR (timestamp=? AND id>=?)) ORDER BY timestamp,id LIMIT ?",
-                    (self.session_id, start["timestamp"], start["timestamp"], start["id"], len(flat)))
-                matched = {}
-                for (key, event), row in zip(flat, rows):
-                    if (row["role"], row["type"], row["content"], row["tool_call_id"]) != (
-                            event["role"], event["type"], event["content"], event.get("tool_call_id")):
+            rows = conn.execute(
+                "SELECT id,role,type,content,tool_call_id FROM events WHERE session_id=? "
+                "ORDER BY timestamp,id", (self.session_id,)).fetchall()
+            # Align only this lifecycle boundary's retained history. Missing
+            # legacy mixed text and duplicated old rows may leave gaps.
+            positions = {}
+            for index, row in enumerate(rows):
+                signature = (row["role"], row["type"], row["content"], row["tool_call_id"])
+                positions.setdefault(signature, []).append(index)
+            matched = {}
+            cursor = -1
+            for key, event in flat:
+                signature = (event["role"], event["type"], event["content"])
+                # Prefer an exact provider ID. Only missing legacy metadata
+                # can be a fallback; another known call must stay distinct.
+                call_ids = [event.get("tool_call_id")]
+                if call_ids[0] is not None:
+                    call_ids.append(None)
+                for call_id in call_ids:
+                    indexes = positions.get((*signature, call_id), [])
+                    offset = bisect_right(indexes, cursor)
+                    if offset < len(indexes):
+                        cursor = indexes[offset]
+                        matched[key] = rows[cursor]["id"]
                         break
-                    matched[key] = row["id"]
-                if len(matched) > len(best):
-                    best = matched
-                if len(best) == len(flat):
-                    break
-            return best
+            return matched
         finally:
             conn.close()
 
@@ -1208,19 +1228,18 @@ class CustomRouterContextEngine(ContextEngine):
             pending_embeddings: List[tuple] = []
             lineage = self.store.get_lineage_chain(self.session_id)
             replay_messages = new_messages
-            if self._resume_replay_pending and new_user_input:
+            if new_user_input:
                 # The explicitly incoming last user is a new turn even if
                 # its text matches an older event at this buffer position.
                 replay_messages = new_messages[:-1]
             replay_ids = self._match_replay_prefix(replay_messages, base_idx) if self._replay_pending else {}
+            if new_messages and new_user_input:
+                # Every explicitly new user occurrence gets its own identity,
+                # including reused positions after compression. A retry has
+                # no unprocessed messages, so it keeps the same namespace.
+                self._event_id_nonce = uuid.uuid4().hex
+                self._current_state["_event_id_nonce"] = self._event_id_nonce
             if new_messages and self._resume_replay_pending:
-                # Retained prefixes may have shifted positions after a
-                # restart, so new events in this buffer need their own
-                # identity namespace. Legacy replay without the explicit
-                # incoming-user signal keeps its saved namespace.
-                if new_user_input:
-                    self._event_id_nonce = uuid.uuid4().hex
-                    self._current_state["_event_id_nonce"] = self._event_id_nonce
                 self._resume_replay_pending = False
             if new_messages:
                 self._replay_pending = False
@@ -1228,9 +1247,10 @@ class CustomRouterContextEngine(ContextEngine):
                 logger.info(f"Processing {len(new_messages)} new messages")
                 for offset, msg in enumerate(new_messages):
                     msg_idx = base_idx + offset
+                    current_incoming = new_user_input and msg_idx == len(messages) - 1
                     # A replay must not re-run a hard topic switch before dedup.
                     preview = parser.parse_message_to_event(msg, self.session_id, self.current_segment_id)
-                    replay_user = (msg.get("role") == "user" and preview and
+                    replay_user = (not current_incoming and msg.get("role") == "user" and preview and
                                    ((msg_idx, 0) in replay_ids or
                                     self._existing_replay_id(preview[0], msg_idx, 0, lineage)))
                     if msg.get("role") == "user" and not replay_user:
@@ -1245,12 +1265,22 @@ class CustomRouterContextEngine(ContextEngine):
 
                     events_data = parser.parse_message_to_event(msg, self.session_id, self.current_segment_id)
                     for sub_idx, ev in enumerate(events_data):
+                        identity = f"{ev['session_id']}:{self._event_id_nonce}" if self._event_id_nonce else ev["session_id"]
+                        if ev.get("tool_call_id"):
+                            identity = f"{identity}:call:{ev['tool_call_id']}"
                         det_id = self.store.make_event_id(
-                            f"{ev['session_id']}:{self._event_id_nonce}" if self._event_id_nonce else ev["session_id"],
+                            identity,
                             msg_idx, ev["role"], ev["content"], sub_idx
                         )
-                        existing_id = replay_ids.get((msg_idx, sub_idx)) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage)
+                        existing_id = None if current_incoming else (
+                            replay_ids.get((msg_idx, sub_idx)) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage))
                         if existing_id:
+                            if (ev["type"] == "tool_call" and ev.get("tool_call_id")
+                                    and existing_id in self._legacy_tool_calls):
+                                # Restore an unfinished legacy call's provider
+                                # alias without reopening completed calls.
+                                self._legacy_tool_calls.remove(existing_id)
+                                self._pending_tool_calls[ev["tool_call_id"]] = existing_id
                             continue
                         event_id, inserted = self.store.add_event(
                             session_id=ev["session_id"], segment_id=ev["segment_id"],
