@@ -25,6 +25,8 @@ Upgrading from 0.5.1 to 0.5.2 requires no additional segment migration. Keep exi
 
 Hermes may replace old tool results in its active transcript with `[Old tool output cleared to save context space]`. During retained-history replay, 0.5.2 recognizes that exact placeholder only through an existing provider call ID or an already matched historical call and its graph edge. The complete stored result remains unchanged; an unrelated call cannot reuse it merely because its placeholder text is identical.
 
+If an already matched historical call has no recoverable output identity because its legacy graph is incomplete, the host's placeholder derivative is skipped without inventing an event ID or graph edge. Historical payloads remain intact. This prevents new duplicates; it does not repair missing historical graph relationships or recover outputs that were never stored.
+
 ## Restore
 
 Stop Gateway and every database writer. Preserve the failed/current database and its WAL/SHM as a separate incident snapshot. Restore the named backup to a **new database path**, verify it with this utility's read-only dry-run, then point the plugin at that restored path and restart Gateway. Using a new path prevents stale WAL/SHM files from being accidentally paired with the backup. Never overwrite a live SQLite database.

@@ -297,6 +297,9 @@ class CustomRouterContextEngine(ContextEngine):
             for event_id in candidates:
                 row = conn.execute("SELECT type,tool_call_id FROM events WHERE id=? AND session_id=?",
                                    (event_id, self.session_id)).fetchone()
+                if (row and row["tool_call_id"] is None and event["type"] == "tool_output"
+                        and event["content"] == "[Old tool output cleared to save context space]"):
+                    continue  # only explicit historical call correlation can identify legacy placeholders
                 if row and row["type"] == event["type"] and (
                         row["tool_call_id"] is None or row["tool_call_id"] == event.get("tool_call_id")):
                     return event_id
@@ -354,8 +357,11 @@ class CustomRouterContextEngine(ContextEngine):
                 signature = (event["role"], event["type"], event["content"])
                 # Prefer an exact provider ID. Only missing legacy metadata
                 # can be a fallback; another known call must stay distinct.
-                call_ids = [event.get("tool_call_id")]
-                if call_ids[0] is not None:
+                provider_id = event.get("tool_call_id")
+                pruned_output = (event["type"] == "tool_output"
+                                 and event["content"] == "[Old tool output cleared to save context space]")
+                call_ids = [] if pruned_output else [provider_id]
+                if call_ids and provider_id is not None:
                     call_ids.append(None)
                 for call_id in call_ids:
                     event_ids = occurrences.get((*signature, call_id))
@@ -363,12 +369,10 @@ class CustomRouterContextEngine(ContextEngine):
                     if existing_id:
                         matched[key] = existing_id
                         break
-                provider_id = event.get("tool_call_id")
                 # Hermes replaces old results in its active transcript. Only
                 # that exact placeholder may reuse a provider/graph-correlated
                 # original; never discard a new result merely by its text.
-                if (key not in matched and event["type"] == "tool_output" and provider_id
-                        and event["content"] == "[Old tool output cleared to save context space]"):
+                if key not in matched and pruned_output and provider_id:
                     existing_id = take(outputs_by_call.get(provider_id))
                     if not existing_id:
                         candidates = graph_outputs.get(matched_calls.get(provider_id))
@@ -381,8 +385,14 @@ class CustomRouterContextEngine(ContextEngine):
                                 break
                     if existing_id:
                         matched[key] = existing_id
+                    elif provider_id in matched_calls:
+                        # Legacy graphs may be incomplete. This is a known
+                        # historical call's host derivative, not a new result;
+                        # skip it without inventing an output ID or graph edge.
+                        matched[key] = None
                 if key in matched:
-                    used.add(matched[key])
+                    if matched[key] is not None:
+                        used.add(matched[key])
                     if event["type"] == "tool_call" and provider_id:
                         matched_calls[provider_id] = matched[key]
             return matched
@@ -1313,8 +1323,11 @@ class CustomRouterContextEngine(ContextEngine):
                             identity,
                             msg_idx, ev["role"], ev["content"], sub_idx
                         )
+                        replay_key = (msg_idx, sub_idx)
+                        if not current_incoming and replay_key in replay_ids and replay_ids[replay_key] is None:
+                            continue  # known historical pruned result with no recoverable graph identity
                         existing_id = None if current_incoming else (
-                            replay_ids.get((msg_idx, sub_idx)) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage))
+                            replay_ids.get(replay_key) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage))
                         if existing_id:
                             if (ev["type"] == "tool_call" and ev.get("tool_call_id")
                                     and existing_id in self._legacy_tool_calls):

@@ -200,8 +200,35 @@ def test_resume_legacy_mixed_text_and_duplicate_rows_align(eng):
     assert eng.store.count_events('A') == before + 5
 
 
+def test_resume_unknown_pruned_call_cannot_use_legacy_deterministic_output(eng):
+    eng.on_session_start('A')
+    old = _tool_history()
+    old[2]['content'] = '[Old tool output cleared to save context space]'
+    eng.on_turn_complete(old)
+    conn = eng.store._get_connection()
+    conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
+    # Install the pre-provider-ID deterministic output identity.
+    output = conn.execute("SELECT id FROM events WHERE type='tool_output'").fetchone()[0]
+    legacy_id = eng.store.make_event_id('A', 2, 'tool', old[2]['content'], 0)
+    conn.execute("UPDATE execution_graph SET to_event_id=? WHERE to_event_id=?", (legacy_id, output))
+    conn.execute("UPDATE events SET id=? WHERE id=?", (legacy_id, output))
+    conn.commit()
+    conn.close()
+    new = copy.deepcopy(old)
+    new[1]['tool_calls'][0]['id'] = 'unrelated-provider'
+    new[1]['tool_calls'][0]['function']['arguments'] = '{"unseen": true}'
+    new[2]['tool_call_id'] = 'unrelated-provider'
+    eng.on_session_start('A')
+    eng.on_turn_complete(new)
+    assert eng.store.count_events('A') == 6
+    conn = eng.store._get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM execution_graph WHERE edge_type='tool_output'").fetchone()[0] == 2
+    conn.close()
+
+
 @pytest.mark.parametrize('legacy_ids', [False, True])
-def test_resume_pruned_outputs_reuses_correlated_originals(eng, legacy_ids):
+@pytest.mark.parametrize('missing_graph', [False, True])
+def test_resume_pruned_outputs_reuses_correlated_originals(eng, legacy_ids, missing_graph):
     eng.on_session_start('A')
     first = _tool_history()
     second = copy.deepcopy(first)
@@ -216,6 +243,11 @@ def test_resume_pruned_outputs_reuses_correlated_originals(eng, legacy_ids):
         conn.execute("UPDATE events SET tool_call_id=NULL WHERE type IN ('tool_call','tool_output')")
         conn.commit()
     conn.close()
+    if missing_graph:
+        conn = eng.store._get_connection()
+        conn.execute("DELETE FROM execution_graph WHERE edge_type='tool_output'")
+        conn.commit()
+        conn.close()
     replay = copy.deepcopy(first + second)
     for message in replay:
         if message['role'] == 'tool':
@@ -225,7 +257,11 @@ def test_resume_pruned_outputs_reuses_correlated_originals(eng, legacy_ids):
     assert eng.store.count_events('A') == 8
     conn = eng.store._get_connection()
     assert list(conn.execute("SELECT id,content FROM events WHERE type='tool_output' ORDER BY timestamp,id")) == original
+    assert conn.execute("SELECT COUNT(*) FROM execution_graph WHERE edge_type='tool_output'").fetchone()[0] == (0 if missing_graph else 2)
     conn.close()
+    # A previous anonymous placeholder must not be selected by text alone.
+    eng.store.add_event('A', eng.current_segment_id, 'tool_output', 'tool',
+                        '[Old tool output cleared to save context space]')
     # An unknown provider call cannot inherit either historical result.
     unknown = copy.deepcopy(second)
     unknown[1]['tool_calls'][0]['id'] = 'call-new'
