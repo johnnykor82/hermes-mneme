@@ -67,7 +67,7 @@ class ContextTools:
                     "`session='all'`. This is the right choice for any question about prior work that "
                     "wasn't in this session."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Natural-language search query."},
@@ -111,7 +111,7 @@ class ContextTools:
                     "extra lookup.\n\n"
                     "By default content is truncated to ~1000 tokens. Pass full=true to get the original."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "event_id": {"type": "string", "description": "Full event id or unique displayed prefix from context_search / expand_context / retrieved chunk."},
@@ -136,7 +136,7 @@ class ContextTools:
                     "  - the user asks 'why did we do X?' or 'what came of Y?' — walk from the seed.\n\n"
                     "depth applies only to mode='neighbors' (1..5)."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "seed_event_id": {"type": "string", "description": "Full event id or unique displayed prefix to start from (required for neighbors; optional for segment if segment_id is given)."},
@@ -157,7 +157,7 @@ class ContextTools:
                     "  - you want to confirm the goal/current_step before suggesting a next action.\n\n"
                     "Falls back to ancestor sessions on compression chains, so it stays usable after compress."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {}
                 }
@@ -169,7 +169,7 @@ class ContextTools:
                     "time range, first/last user-message snippet. Cheap to call. Start here when you "
                     "need to navigate older parts of the session."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer", "default": 10, "description": "Max segments to return (most recent first)."}
@@ -183,7 +183,7 @@ class ContextTools:
                     "Use this when you need to remember what you were working on N turns ago and the "
                     "[GOAL TRAIL] in the system prompt only shows the latest 3."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer", "default": 20, "description": "Max history rows (most recent N)."}
@@ -200,7 +200,7 @@ class ContextTools:
                     "'what happened N turns ago'. Long contents are truncated to 600 chars; use "
                     "fetch_event(event_id) on a specific event for the full content."
                 ),
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
                         "turns": {

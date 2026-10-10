@@ -20,6 +20,27 @@ class _EngineStub:
     session_id = "tool-session"
 
 
+@pytest.mark.parametrize("name, properties, required", [
+    ("context_search", {"query": "string", "k": "integer", "segment": "string", "session": ["string", "array"]}, ["query"]),
+    ("fetch_event", {"event_id": "string", "full": "boolean"}, ["event_id"]),
+    ("expand_context", {"seed_event_id": "string", "segment_id": "string", "mode": "string", "depth": "integer"}, []),
+    ("get_execution_state", {}, []),
+    ("list_segments", {"limit": "integer"}, []),
+    ("get_goal_history", {"limit": "integer"}, []),
+    ("recall_recent", {"turns": "integer"}, []),
+])
+def test_memory_tools_export_native_parameters(name, properties, required):
+    schemas = ContextTools(None, None, None, None).get_tool_schemas()
+    assert len(schemas) == 7
+    schema = next(s for s in schemas if s["name"] == name)
+    assert "parameters" in schema, "Hermes native tools require parameters, not input_schema"
+    assert "input_schema" not in schema
+    params = schema["parameters"]
+    assert params["type"] == "object"
+    assert {key: value["type"] for key, value in params["properties"].items()} == properties
+    assert params.get("required", []) == required
+
+
 @pytest.mark.parametrize("k", ["30", -1, True, False, 3.5, [], {}])
 def test_context_search_invalid_k_names_public_argument(k):
     index = Mock()
