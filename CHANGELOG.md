@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clarify the tool description for searching earlier topics in the same session, where `segment='all'` must be explicit.
 - Report invalid search limits using the public `k` parameter and reject the unsupported `top_k` name instead of silently using the default limit.
 - Export native context-tool argument schemas as OpenAI-compatible `parameters`, so Hermes and the provider receive the declared types and required fields.
+- Repair malformed Mneme schemas retained in Hermes session tool pins before resume restores them; preserve the pin version, tool order, unrelated schemas and message history.
 
 ### Validation
 - Added regressions for legacy transcript gaps, reordered/backfilled history, pruned tool results, distinct tool-call identities, compression boundaries and repeated native-hook requests.

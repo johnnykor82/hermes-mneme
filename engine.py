@@ -2099,6 +2099,38 @@ class CustomRouterContextEngine(ContextEngine):
         status["budget_overflow"] = getattr(self, "_last_budget_overflow", None)
         return status
 
+    def bind_session_state(self, *, session_db=None, session_id=None):
+        """Repair pre-0.5.2 native schemas frozen in Hermes' session tool pin."""
+        if session_db is None or not session_id:
+            return
+        getter = getattr(session_db, "get_session", None)
+        setter = getattr(session_db, "update_session_tool_names", None)
+        if not callable(getter) or not callable(setter):
+            return
+        row = getter(session_id) or {}
+        try:
+            pin = json.loads(row.get("tool_names") or "null")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(pin, dict) or not isinstance(pin.get("tools"), list):
+            return
+        names = {s["name"] for s in self.get_tool_schemas()}
+        changed = False
+        for tool in pin["tools"]:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or fn["name"] not in names:
+                continue
+            old = fn.get("input_schema")
+            params = fn.get("parameters")
+            if not isinstance(old, dict) or old.get("type") != "object" or not isinstance(old.get("properties"), dict):
+                continue
+            if params is not None and params != {"type": "object", "properties": {}, "required": []}:
+                continue
+            fn["parameters"] = fn.pop("input_schema")
+            changed = True
+        if changed:
+            setter(session_id, pin)
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return self.tools.get_tool_schemas()
 

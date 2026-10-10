@@ -1,5 +1,7 @@
 """Offline regression coverage for audited lifecycle and graph paths."""
 import copy
+import json
+from unittest.mock import Mock
 import pytest
 from hermes_mneme.engine import CustomRouterContextEngine
 from hermes_mneme.config import PluginConfig
@@ -22,6 +24,58 @@ def eng(tmp_path, monkeypatch):
 
 def ingest(e, messages):
     e._process_context_messages(messages, assemble=False, caller='audit')
+
+
+def test_bind_repairs_only_legacy_native_tool_pin_and_is_idempotent(eng):
+    original = eng.get_tool_schemas()
+    stale = [{"type": "function", "function": {
+        **{k: v for k, v in s.items() if k != "parameters"},
+        "input_schema": s["parameters"],
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }} for s in original]
+    stale[0]["function"].pop("parameters")
+    other = {"type": "function", "function": {"name": "other", "input_schema": {"type": "object"}}}
+    pin = {"version": "host-sha-unchanged", "tools": [other, *stale]}
+    db = Mock()
+    db.get_session.return_value = {"tool_names": json.dumps(pin)}
+    eng.bind_session_state(session_db=db, session_id="A")
+    db.get_session.assert_called_once_with("A")
+    sid, repaired = db.update_session_tool_names.call_args.args
+    assert sid == "A"
+    assert repaired["version"] == pin["version"]
+    assert repaired["tools"][0] == other
+    for tool, schema in zip(repaired["tools"][1:], original):
+        assert tool["function"]["parameters"] == schema["parameters"]
+        assert "input_schema" not in tool["function"]
+    db.get_session.return_value = {"tool_names": json.dumps(repaired)}
+    db.update_session_tool_names.reset_mock()
+    eng.bind_session_state(session_db=db, session_id="A")
+    db.update_session_tool_names.assert_not_called()
+
+
+@pytest.mark.parametrize("pin", [None, ["context_search"], {"version": "x", "tools": [
+    {"type": "function", "function": {"name": "context_search", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}}},
+        "input_schema": {"type": "object", "properties": {"wrong": {"type": "string"}}}}}
+]}])
+def test_bind_preserves_valid_or_legacy_name_only_pins(eng, pin):
+    db = Mock()
+    db.get_session.return_value = {"tool_names": json.dumps(pin) if pin else None}
+    eng.bind_session_state(session_db=db, session_id="A")
+    db.update_session_tool_names.assert_not_called()
+
+
+@pytest.mark.parametrize("raw", ["not JSON", "[]", '{"tools": null}', '{"tools": [null, "other", {"function": null}, {"function": {"name": []}}]}'])
+def test_bind_ignores_malformed_tool_pins(eng, raw):
+    db = Mock()
+    db.get_session.return_value = {"tool_names": raw}
+    eng.bind_session_state(session_db=db, session_id="A")
+    db.update_session_tool_names.assert_not_called()
+
+
+def test_bind_accepts_hosts_without_tool_pin_api(eng):
+    eng.bind_session_state(session_db=object(), session_id="A")
+    eng.bind_session_state(session_db=None, session_id="A")
 
 
 def test_fresh_and_new_bind_segment_and_state(eng):

@@ -1,6 +1,12 @@
 # Explicit legacy segment migration
 
-The plugin never runs this migration automatically. `scripts/migrate_legacy_segments.py` defaults to a read-only dry-run and imports neither `ContextStore` nor the engine. It repairs only legacy `seg_1` session collisions. It does not reconstruct historical topic boundaries.
+## Hermes session tool pins in 0.5.2
+
+Back up Hermes `state.db` through SQLite's backup API as well as Mneme `plugin.db` before upgrading. Hermes stores frozen tool definitions in session tool pins in `state.db`; a plugin upgrade alone does not invalidate those pins when the Hermes version is unchanged.
+
+On session binding, Mneme repairs only its seven native tool descriptors that retain an old `input_schema` with absent or minimal empty `parameters`. The original stored argument schema moves to `parameters`; the pin version, tool order, other descriptors and message history remain unchanged. Correct schemas and legacy name-only pins are untouched. Repeated binding is a no-op after repair. Restore the pre-upgrade `state.db` backup with all writers stopped if the previous pin bytes are needed for rollback.
+
+The plugin never runs the legacy segment migration automatically. `scripts/migrate_legacy_segments.py` defaults to a read-only dry-run and imports neither `ContextStore` nor the engine. It repairs only legacy `seg_1` session collisions. It does not reconstruct historical topic boundaries.
 
 Use the Hermes Python environment with `sqlite-vec` installed. The extension is loaded on every source, backup and verification connection when available; a vec0 database is refused if the extension is unavailable.
 
