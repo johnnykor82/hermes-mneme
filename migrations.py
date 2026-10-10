@@ -17,12 +17,14 @@ MIGRATION_ID = 'legacy-segment-scope-v1'
 def _connect(path, *, readonly=False):
     conn = sqlite3.connect(Path(path).resolve().as_uri() + ('?mode=ro' if readonly else '?mode=rw'), uri=True)
     try:
-        try:
-            import sqlite_vec
-        except ImportError:
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE sql LIKE '%USING vec0%' LIMIT 1").fetchone():
-                raise RuntimeError('sqlite-vec is required to inspect this database')
-        else:
+        has_vec = conn.execute("SELECT 1 FROM sqlite_master WHERE sql LIKE '%USING vec0%' LIMIT 1").fetchone()
+        if has_vec:
+            if not hasattr(conn, 'enable_load_extension'):
+                raise RuntimeError('This Python SQLite build cannot load sqlite-vec; use an extension-enabled Python')
+            try:
+                import sqlite_vec
+            except ImportError as exc:
+                raise RuntimeError('sqlite-vec is required to inspect this database') from exc
             conn.enable_load_extension(True)
             try:
                 sqlite_vec.load(conn)

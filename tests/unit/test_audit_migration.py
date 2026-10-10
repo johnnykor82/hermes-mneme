@@ -147,3 +147,16 @@ def test_scope_index_exists_before_first_group(legacy, tmp_path, monkeypatch):
     monkeypatch.setattr(migrations, '_apply_group', verify_index)
     migrations.migrate_legacy_segments(legacy, apply=True, backup_path=tmp_path / 'indexed-backup.db')
     assert len(visited) == 441
+
+
+def test_plain_database_does_not_require_sqlite_extension_api(legacy, monkeypatch):
+    original_connect = sqlite3.connect
+    class NoExtensions:
+        def __init__(self, connection):
+            self.connection = connection
+        def __getattr__(self, name):
+            if name in ('enable_load_extension', 'load_extension'):
+                raise AttributeError(name)
+            return getattr(self.connection, name)
+    monkeypatch.setattr(migrations.sqlite3, 'connect', lambda *args, **kwargs: NoExtensions(original_connect(*args, **kwargs)))
+    assert migrations.migrate_legacy_segments(legacy)['affected_events'] == 882

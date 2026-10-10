@@ -25,8 +25,10 @@ Stop Gateway and every database writer. Preserve the failed/current database and
 
 ## Regression evidence
 
-`tests/unit/test_audit_migration.py`: initial run failed at collection because the migration module did not exist. After implementation: **8 passed** in Hermes Python, temporary SQLite fixtures only.
+`tests/unit/test_audit_migration.py`: initial run failed at collection because the migration module did not exist. After implementation: **9 passed** in Hermes Python, temporary SQLite fixtures only.
 
 Covered: 441 shared legacy sessions; collision fallback; session-specific metadata/state; preserved event/graph digests; second-run idempotence; byte-identical read-only dry-run; required exclusive backup including rejection of dangling symlinks; injected exception after first session's updates with full rollback and usable backup; outstanding WAL included in backup; real sqlite-vec extension loaded across source/backup/reopen, 882 vector rows retained and no dangling vector mappings; canonical embedding mutation detected and fully rolled back; centroid query uses the new composite index, created before any session updates. Vector metadata has an event/model lookup index before updates.
 
 No production database is changed by these tests. Production-copy counts and timings belong to the final release audit report.
+
+Plain databases work even when Python has no SQLite extension-loading API. A database with vec0 requires an extension-enabled Python plus sqlite-vec; the utility fails explicitly rather than misreporting database corruption.
