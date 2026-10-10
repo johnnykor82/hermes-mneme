@@ -104,6 +104,80 @@ def test_rollover_shifted_retained_tail_does_not_duplicate(eng):
     assert eng.store.count_events('S1') == 4
 
 
+@pytest.mark.parametrize('answer', ['new answer', 'old answer'])
+@pytest.mark.parametrize('binding', ['hook', 'auto'])
+def test_resume_with_empty_history_preserves_identical_new_user(eng, answer, binding):
+    request = {'role': 'user', 'content': 'Give me the remembered access code again.'}
+    eng.on_session_start('A')
+    eng.on_turn_complete([request, {'role': 'assistant', 'content': 'old answer'}])
+    if binding == 'hook':
+        eng.on_session_start('A')
+    else:
+        eng.session_id = None
+        eng._processed_msg_count = 0
+    eng.select_context([request], conversation_messages=[request], incoming_message=request)
+    eng.on_turn_complete([request, {'role': 'assistant', 'content': answer}])
+    assert eng.store.count_events('A') == 4
+    assert eng.store.load_state('A')['turn_count'] == 2
+    # Repeated completion of this same buffer must still be idempotent.
+    eng.on_turn_complete([request, {'role': 'assistant', 'content': answer}])
+    assert eng.store.count_events('A') == 4
+    eng.on_session_start('B', boundary_reason='compression', old_session_id='A')
+    eng.on_turn_complete([request, {'role': 'assistant', 'content': answer}])
+    assert eng.store.count_events('B') == 4
+
+
+def test_resume_retained_transcript_does_not_duplicate(eng):
+    eng.on_session_start('A')
+    messages = [{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': 'answer'}]
+    eng.on_turn_complete(messages)
+    eng.on_session_start('A')
+    eng.on_turn_complete(messages)
+    assert eng.store.count_events('A') == 2
+
+
+def test_resume_legacy_pending_user_keeps_replay_identity(eng):
+    eng.on_session_start('A')
+    messages = [{'role': 'user', 'content': 'unfinished request'}]
+    ingest(eng, messages)
+    eng.on_session_start('A')
+    ingest(eng, messages)
+    assert eng.store.count_events('A') == 1
+    assert eng.store.load_state('A')['turn_count'] == 1
+
+
+def test_resume_short_retained_history_preserves_new_identical_turn(eng):
+    request = {'role': 'user', 'content': 'repeat the access code'}
+    answer = {'role': 'assistant', 'content': 'same answer'}
+    eng.on_session_start('A')
+    eng.on_turn_complete([request, answer, request, answer, request, answer])
+    eng.on_session_start('A')
+    retained = [request, answer]
+    eng.select_context(retained + [request], conversation_messages=retained + [request], incoming_message=request)
+    eng.on_turn_complete(retained + [request, answer])
+    assert eng.store.count_events('A') == 8
+    assert eng.store.load_state('A')['turn_count'] == 4
+
+
+def test_resume_restores_namespace_for_legacy_completion_after_replay(eng):
+    request = {'role': 'user', 'content': 'repeat the access code'}
+    answer = {'role': 'assistant', 'content': 'same answer'}
+    eng.on_session_start('A')
+    eng.on_turn_complete([request, answer, request, answer, request, answer])
+    eng.on_session_start('A')
+    eng.select_context([request], conversation_messages=[request], incoming_message=request)
+    eng.on_turn_complete([request, answer])
+    nonce = eng._event_id_nonce
+    assert nonce and eng.store.load_state('A')['_event_id_nonce'] == nonce
+    eng.on_session_start('A')
+    assert eng._event_id_nonce == nonce
+    eng.on_turn_complete([request, answer])
+    assert eng.store.count_events('A') == 8
+    eng.on_turn_complete([request, answer, request, answer])
+    assert eng.store.count_events('A') == 10
+    assert eng.store.load_state('A')['turn_count'] == 5
+
+
 def test_reset_waits_for_inflight_ingestion(eng, monkeypatch):
     import threading
     eng.on_session_start('A')
