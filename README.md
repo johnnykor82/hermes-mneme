@@ -15,7 +15,7 @@ The default compressor drops detail when the window fills. LCM keeps everything 
 ## Features
 
 - **SQLite event store** with deterministic event_ids — re-ingest is idempotent across compactions and session resumes.
-- **Embedding index** via [sqlite-vec](https://github.com/asg017/sqlite-vec) (KNN) with Python fallback. Supports any OpenAI-compatible embedding endpoint (Jina-MLX local default, Ollama, OpenAI, …).
+- **Embedding index** via [sqlite-vec](https://github.com/asg017/sqlite-vec) (exact scoped cosine) with Python fallback. Supports any OpenAI-compatible embedding endpoint (Jina-MLX local default, Ollama, OpenAI, …).
 - **Session segmenter** — auto-detects topic boundaries via embedding drift; sliding centroid for evolving topics.
 - **Intent classifier** (CONTINUATION / SWITCH / NEW_TASK / CLARIFICATION) — deterministic, no LLM in the hot path.
 - **Execution graph** — tracks `tool_call → tool_output → decision` edges; powers dependency-propagation scoring (Stage 7).
@@ -26,7 +26,7 @@ The default compressor drops detail when the window fills. LCM keeps everything 
 
 ## Install
 
-Version 0.4.0 uses Hermes' native `select_context()` and
+Version 0.5.0 uses Hermes' native `select_context()` and
 `on_turn_complete()` hooks when both are available. Context selection changes
 only the outgoing request; completed turns are ingested into memory without
 forcing `compress()` on every step. Older Hermes builds retain the legacy
@@ -51,7 +51,7 @@ You should see: `Hermes-Mneme context engine loaded.`
 
 ## Configuration
 
-All settings have sensible defaults. Override via:
+Settings load in order: defaults → `config.yaml` → environment → explicit constructor values. Invalid values are ignored with a diagnostic. Override via:
 - environment variables: `HERMES_CTX_<KEY>` (e.g. `HERMES_CTX_PROTECTED_TAIL_TURNS=12`)
 - `config.yaml` in the plugin directory
 
@@ -62,6 +62,16 @@ Key knobs:
 - `dependency_max_depth` / `dependency_decay` — execution-graph propagation
 - `reranker_enabled` + `reranker_endpoint` — second-stage ranking
 - `llm_enrichment_enabled` — async state enrichment
+- `segmentation_enabled`, `drift_threshold`, `drift_weights` — topic boundary policy; disabled blocks hard and soft switches. Embedding-only drift is `(1-cos)/2`, without weights for unavailable signals. Threshold 0.35 is configurable and has not been calibrated on a real RU/EN gold set.
+- `embedding_endpoint`, `embedding_model`, `embedding_api_key`, `embedding_dim` — instance embedding settings; dimensions 768/1024/1536 tested. Match model and dimension; changing semantics requires explicit reindexing.
+
+`context_search(query='...', segment='current', session='current')` searches only the active topic. Use `segment='all'` for all topics and both `segment='all', session='all'` for explicit global recall. Global exact/unlimited searches can be expensive on large databases.
+
+Impossible estimated prompt budgets raise `PromptBudgetExceeded` with `actual_tokens` and `budget_tokens`. The current Hermes host catches hook errors and falls back to its original request; provider limits still need host enforcement.
+
+Existing shared `seg_1` data is not renamed automatically. Use the [backed-up migration guide](docs/audit-migration.md) for dry-run, explicit application and rollback. See the [audit verification report](docs/AUDIT-2026-10-10.md) for confirmed findings, production-copy integrity, benchmarks and test limitations.
+
+Compatibility is detected by hook availability: hosts with both `select_context` and `on_turn_complete` use native mode; older hosts retain `compress`. Tests cover the native hook ABI and legacy-hook absence. A numeric minimum host release is not established.
 
 See [`config.py`](config.py) for the full schema with inline RU+EN docs.
 

@@ -42,9 +42,12 @@ def parse_message_to_event(msg: Dict[str, Any], session_id: str, segment_id: str
                     "content": json.dumps(tc.get("function", {})), # Store function details
                     "tool_name": tc.get("function", {}).get("name"),
                     "tool_input": json.loads(tc.get("function", {}).get("arguments", "{}")),
+                    "tool_call_id": tc.get("id"),
                     "token_estimate": token_estimate // max(len(tool_calls), 1)
                 })
-        else:
+        # Keep existing tool-call subindices stable for deterministic replay IDs.
+        # Mixed assistant responses also carry independently useful text.
+        if not tool_calls or content:
             # Regular assistant message
             events.append({
                 "id": str(uuid.uuid4()),
@@ -69,6 +72,7 @@ def parse_message_to_event(msg: Dict[str, Any], session_id: str, segment_id: str
             "content": content,
             "tool_name": msg.get("name"), # Tool name might be in 'name' or derived from context
             "tool_input": None,
+            "tool_call_id": msg.get("tool_call_id"),
             "token_estimate": token_estimate
         })
 

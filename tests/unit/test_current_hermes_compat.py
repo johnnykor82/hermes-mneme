@@ -88,7 +88,7 @@ def test_deepcopy_does_not_inherit_active_session_state(tmp_path):
         clone = copy.deepcopy(engine)
 
         assert clone.session_id is None
-        assert clone.current_segment_id == "seg_1"
+        assert clone.current_segment_id == "seg_unbound"
         assert clone._pending_session_id is None
         assert clone._processed_msg_count == 0
         assert clone._current_state["session_id"] is None

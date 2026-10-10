@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+from functools import wraps
 from typing import Dict, List, Any, Optional
 
 MEMORY_ACCESS_HINT_SHORT = """[MEMORY ACCESS]
@@ -96,9 +97,19 @@ def _get_session_lock(session_id: str) -> threading.Lock:
         return lock
 
 
+def _serialize_engine(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lifecycle_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class CustomRouterContextEngine(ContextEngine):
     def __init__(self, db_path: str = DEFAULT_DB_PATH, config: config_module.PluginConfig = None):
         super().__init__()
+        self._lifecycle_lock = threading.RLock()
+        self._replay_pending = False
         self.session_id = None
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
@@ -107,9 +118,13 @@ class CustomRouterContextEngine(ContextEngine):
         self.config = config
 
         # Initialize components
-        self.store = store.ContextStore(db_path)
-        self.indexer = index.EmbeddingIndex(db_path)
-        self.current_segment_id = "seg_1"
+        self.store = store.ContextStore(db_path, embedding_dim=self.config.get("embedding_dim", 1024))
+        self.indexer = index.EmbeddingIndex(db_path, config=self.config)
+        self._pending_tool_calls = {}
+        self._legacy_tool_calls = []
+        self._last_tool_outputs = []
+        self._graph_session_id = None
+        self.current_segment_id = "seg_unbound"
         self.segmenter = segmenter.SessionSegmenter(self.store, self.indexer, self.current_segment_id, config=self.config)
         self.context_router = router.ContextRouter(self.store, self.indexer, config=self.config, segmenter=self.segmenter)
         self.prompt_builder = prompt_builder.PromptBuilder(
@@ -215,6 +230,100 @@ class CustomRouterContextEngine(ContextEngine):
         # either re-embed everything or warn, depending on reindex_on_model_change.
         self._check_and_reindex_embeddings()
 
+    @property
+    def current_segment_id(self):
+        return self._current_segment_id
+
+    @current_segment_id.setter
+    def current_segment_id(self, value):
+        """Keep every lifecycle assignment bound to the same session and segment."""
+        self._current_segment_id = value
+        segmenter = getattr(self, "segmenter", None)
+        if segmenter is not None and (segmenter.session_id != self.session_id
+                                      or segmenter.current_segment_id != value):
+            segmenter.bind_session(self.session_id, value)
+        state = getattr(self, "_current_state", None)
+        if state is not None:
+            state["session_id"] = self.session_id
+            state["segment_id"] = value if self.session_id else None
+        if getattr(self, "_graph_session_id", None) != self.session_id:
+            self._graph_session_id = self.session_id
+            self._pending_tool_calls = {}
+            self._legacy_tool_calls = []
+            self._last_tool_outputs = []
+            if self.session_id:
+                self._restore_tool_calls()
+
+    def _restore_tool_calls(self):
+        conn = self.store._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT id,tool_call_id FROM events WHERE session_id=? AND type='tool_call' "
+                "AND NOT EXISTS (SELECT 1 FROM execution_graph g WHERE g.from_event_id=events.id "
+                "AND g.edge_type='tool_output') ORDER BY timestamp,id", (self.session_id,))
+            for row in rows:
+                if row["tool_call_id"]:
+                    self._pending_tool_calls[row["tool_call_id"]] = row["id"]
+                else:
+                    self._legacy_tool_calls.append(row["id"])
+            outputs = conn.execute(
+                "SELECT id FROM events WHERE session_id=? AND type='tool_output' "
+                "AND timestamp > COALESCE((SELECT MAX(timestamp) FROM events "
+                "WHERE session_id=? AND type='assistant_message'), '') "
+                "AND NOT EXISTS (SELECT 1 FROM execution_graph g WHERE g.from_event_id=events.id "
+                "AND g.edge_type='decision') ORDER BY timestamp,id",
+                (self.session_id, self.session_id))
+            self._last_tool_outputs = [row["id"] for row in outputs]
+        finally:
+            conn.close()
+
+    def _existing_replay_id(self, event, msg_index, sub_index, lineage):
+        """Recognize deterministic IDs created before a compression rebind."""
+        candidates = [self.store.make_event_id(sid, msg_index, event["role"],
+                      event["content"], sub_index) for sid in lineage]
+        return self.store.existing_event_id(candidates, self.session_id)
+
+    def _match_replay_prefix(self, messages, base_idx):
+        """Match retained transcript prefixes even after their positions shift.
+
+        Only the first buffer after a lifecycle boundary is eligible; normal
+        new turns keep position-based identity so repeated utterances survive.
+        """
+        flat = []
+        for offset, message in enumerate(messages):
+            for sub_index, event in enumerate(parser.parse_message_to_event(
+                    message, self.session_id, self.current_segment_id)):
+                flat.append(((base_idx + offset, sub_index), event))
+        if not flat:
+            return {}
+        first = flat[0][1]
+        conn = self.store._get_connection()
+        best = {}
+        try:
+            starts = conn.execute(
+                "SELECT timestamp,id FROM events WHERE session_id=? AND role=? "
+                "AND type=? AND content=? ORDER BY timestamp DESC,id DESC",
+                (self.session_id, first["role"], first["type"], first["content"]))
+            for start in starts:
+                rows = conn.execute(
+                    "SELECT id,role,type,content,tool_call_id FROM events WHERE session_id=? "
+                    "AND (timestamp>? OR (timestamp=? AND id>=?)) ORDER BY timestamp,id LIMIT ?",
+                    (self.session_id, start["timestamp"], start["timestamp"], start["id"], len(flat)))
+                matched = {}
+                for (key, event), row in zip(flat, rows):
+                    if (row["role"], row["type"], row["content"], row["tool_call_id"]) != (
+                            event["role"], event["type"], event["content"], event.get("tool_call_id")):
+                        break
+                    matched[key] = row["id"]
+                if len(matched) > len(best):
+                    best = matched
+                if len(best) == len(flat):
+                    break
+            return best
+        finally:
+            conn.close()
+
+    @_serialize_engine
     def __deepcopy__(self, memo):
         """Create an agent-local engine without copying unsafe runtime state."""
         cached = memo.get(id(self))
@@ -266,8 +375,7 @@ class CustomRouterContextEngine(ContextEngine):
         - Otherwise → log a warning that retrieval may degrade until the user
           either reindexes or reverts the model.
         """
-        from .index import JINA_MODEL
-        configured_model = JINA_MODEL
+        configured_model = self.indexer.model_id
         try:
             conn = self.store._get_connection()
             rows = conn.execute(
@@ -306,8 +414,6 @@ class CustomRouterContextEngine(ContextEngine):
 
     def _reindex_under_model(self, target_model: str, stale_models: set) -> None:
         """Drop embeddings for stale models and re-embed all events under target_model."""
-        from .index import JINA_MODEL
-
         conn = self.store._get_connection()
         try:
             placeholders = ",".join("?" for _ in stale_models)
@@ -653,6 +759,7 @@ class CustomRouterContextEngine(ContextEngine):
         """Legacy fallback for Hermes versions without native Mneme hooks."""
         return not self._native_hooks_available()
 
+    @_serialize_engine
     def on_turn_complete(
         self,
         messages: List[Dict[str, Any]],
@@ -707,6 +814,7 @@ class CustomRouterContextEngine(ContextEngine):
             caller="prepare_request_messages",
         )
 
+    @_serialize_engine
     def _prepare_native_request_context(
         self,
         request_messages: List[Dict[str, Any]],
@@ -751,14 +859,28 @@ class CustomRouterContextEngine(ContextEngine):
                 request_system_prompt = str((msg or {}).get("content", ""))
                 break
         request_tail = [m for m in request_messages if m.get("role") != "system"]
-        prepared = self._process_context_messages(
-            source_messages,
-            current_tokens=None,
-            assemble=True,
-            caller=caller,
-            system_prompt_override=request_system_prompt,
-            request_tail=request_tail,
-        )
+        previous_budget = self._budget_tokens
+        previous_builder_budget = self.prompt_builder.total_budget
+        if budget_tokens and budget_tokens > 0:
+            self._budget_tokens = min(previous_budget, int(budget_tokens)) if previous_budget > 0 else int(budget_tokens)
+            self.prompt_builder.total_budget = self._budget_tokens
+        try:
+            prepared = self._process_context_messages(
+                source_messages,
+                current_tokens=None,
+                assemble=True,
+                caller=caller,
+                system_prompt_override=request_system_prompt,
+                request_tail=request_tail,
+            )
+        except prompt_builder.PromptBudgetExceeded as exc:
+            self._last_budget_overflow = {"actual_tokens": exc.actual_tokens,
+                                          "budget_tokens": exc.budget_tokens}
+            logger.error("Context cannot fit mandatory content: %s", exc)
+            raise
+        finally:
+            self._budget_tokens = previous_budget
+            self.prompt_builder.total_budget = previous_builder_budget
         if prepared is source_messages or prepared is request_tail:
             prepared = None
         # Ingestion can rebind the session. Snapshot the result before the
@@ -778,6 +900,7 @@ class CustomRouterContextEngine(ContextEngine):
             caller="legacy_compress",
         )
 
+    @_serialize_engine
     def _process_context_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -921,6 +1044,7 @@ class CustomRouterContextEngine(ContextEngine):
                             )
                         except Exception as e:
                             logger.warning(f"compress: drift reassign failed: {e}")
+                            raise
                 self.session_id = hermes_sid
                 self.current_segment_id = f"seg_{hermes_sid}_1"
                 self._processed_msg_count = -1
@@ -978,6 +1102,7 @@ class CustomRouterContextEngine(ContextEngine):
                             carried_over = True
                         except Exception as e:
                             logger.warning(f"compress: drift reassign failed: {e}")
+                            raise
                 self.session_id = hermes_sid
                 self.current_segment_id = f"seg_{hermes_sid}_1"
                 # Sentinel: anchor binding origin to last user message on
@@ -1058,16 +1183,24 @@ class CustomRouterContextEngine(ContextEngine):
             if len(messages) < self._processed_msg_count:
                 logger.info(f"messages shrank ({len(messages)} < {self._processed_msg_count}) — resetting cursor")
                 self._processed_msg_count = 0
+                self._replay_pending = True
             new_messages = messages[self._processed_msg_count:]
             base_idx = self._processed_msg_count
             segment_changed_this_turn = False
             pending_embeddings: List[tuple] = []
+            lineage = self.store.get_lineage_chain(self.session_id)
+            replay_ids = self._match_replay_prefix(new_messages, base_idx) if self._replay_pending else {}
+            self._replay_pending = False
             if new_messages:
                 logger.info(f"Processing {len(new_messages)} new messages")
-                from .index import JINA_MODEL
                 for offset, msg in enumerate(new_messages):
                     msg_idx = base_idx + offset
-                    if msg.get("role") == "user":
+                    # A replay must not re-run a hard topic switch before dedup.
+                    preview = parser.parse_message_to_event(msg, self.session_id, self.current_segment_id)
+                    replay_user = (msg.get("role") == "user" and preview and
+                                   ((msg_idx, 0) in replay_ids or
+                                    self._existing_replay_id(preview[0], msg_idx, 0, lineage)))
+                    if msg.get("role") == "user" and not replay_user:
                         prev_seg = self.current_segment_id
                         self.current_segment_id = self.segmenter.handle_new_message(
                             self.session_id,
@@ -1082,11 +1215,15 @@ class CustomRouterContextEngine(ContextEngine):
                         det_id = self.store.make_event_id(
                             ev["session_id"], msg_idx, ev["role"], ev["content"], sub_idx
                         )
+                        existing_id = replay_ids.get((msg_idx, sub_idx)) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage)
+                        if existing_id:
+                            continue
                         event_id, inserted = self.store.add_event(
                             session_id=ev["session_id"], segment_id=ev["segment_id"],
                             event_type=ev["type"], role=ev["role"], content=ev["content"],
                             tool_name=ev["tool_name"], tool_input=ev["tool_input"],
                             token_estimate=ev["token_estimate"], event_id=det_id,
+                            tool_call_id=ev.get("tool_call_id"),
                         )
                         if not inserted:
                             continue
@@ -1106,7 +1243,7 @@ class CustomRouterContextEngine(ContextEngine):
                         if text_for_embedding and len(text_for_embedding.strip()) > 5:
                             pending_embeddings.append((
                                 event_id, ev["segment_id"], text_for_embedding,
-                                JINA_MODEL, ev["token_estimate"], ev["type"],
+                                self.indexer.model_id, ev["token_estimate"], ev["type"],
                             ))
 
                         self._record_graph_edges(ev, event_id)
@@ -1168,7 +1305,7 @@ class CustomRouterContextEngine(ContextEngine):
         # ---
         try:
             content_tokens = sum(
-                self.prompt_builder.tokenizer(str(m.get("content", ""))) + 4
+                self.prompt_builder.count_message_tokens(m)
                 for m in [*request_prefix, *messages]
             )
         except Exception:
@@ -1182,9 +1319,9 @@ class CustomRouterContextEngine(ContextEngine):
         # misses some of this (its preflight is computed before the final
         # call adds wrappers), so we add the empirically-observed delta
         # from update_from_response on top.
-        effective_tokens = (
-            max(content_tokens, current_tokens or 0) + self._observed_prompt_overhead
-        )
+        visible_system_tokens = self.prompt_builder.tokenizer(system_prompt_override or "")
+        effective_tokens = (max(content_tokens, current_tokens or 0)
+                            + max(self._observed_prompt_overhead, visible_system_tokens))
 
         # Enrichment: collect any finished bg future + maybe submit a new one.
         # Cheap on the hot path (LLM call runs in a background executor); kept
@@ -1527,21 +1664,30 @@ class CustomRouterContextEngine(ContextEngine):
         return final_messages
 
     def _record_graph_edges(self, ev: Dict, event_id: str):
-        """Record execution graph edges for tool calls and outputs."""
+        """Match parallel calls by provider ID; legacy calls use FIFO."""
+        call_id = ev.get("tool_call_id")
         if ev["type"] == "tool_call":
-            self._last_tool_call_id = event_id
+            if call_id:
+                self._pending_tool_calls[call_id] = event_id
+            else:
+                self._legacy_tool_calls.append(event_id)
         elif ev["type"] == "tool_output":
-            if hasattr(self, '_last_tool_call_id'):
-                self.graph.add_edge(self._last_tool_call_id, event_id, "tool_output", self.session_id)
-                del self._last_tool_call_id
-            self._last_tool_output_id = event_id
-        elif ev["type"] == "assistant_message" and hasattr(self, '_last_tool_output_id'):
-            self.graph.add_edge(self._last_tool_output_id, event_id, "decision", self.session_id)
-            del self._last_tool_output_id
+            source = self._pending_tool_calls.pop(call_id, None) if call_id else (
+                self._legacy_tool_calls.pop(0) if self._legacy_tool_calls else None)
+            if source:
+                self.graph.add_edge(source, event_id, "tool_output", self.session_id)
+            else:
+                logger.warning("Tool output has no matching pending call (session=%s)", self.session_id)
+            self._last_tool_outputs.append(event_id)
+        elif ev["type"] == "assistant_message":
+            for source in self._last_tool_outputs:
+                self.graph.add_edge(source, event_id, "decision", self.session_id)
+            self._last_tool_outputs.clear()
 
     def _update_state_from_event(self, ev: Dict, event_id: str):
         """Deterministic state update from event (Component 3)."""
         if ev["type"] == "user_message":
+            self._current_state["segment_id"] = ev["segment_id"]
             # Fix A: increment turn_count on every ingested user_message so
             # the live state reflects actual conversation depth even when
             # Hermes doesn't call update_from_response (observed in prod:
@@ -1570,6 +1716,7 @@ class CustomRouterContextEngine(ContextEngine):
             if content:
                 self._current_state["current_step"] = content[:200]
 
+    @_serialize_engine
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Decide inheritance strictly from Hermes-supplied kwargs.
 
@@ -1589,6 +1736,7 @@ class CustomRouterContextEngine(ContextEngine):
         declare a boundary.
         """
         self._native_request_cache = None
+        self._replay_pending = True
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self.session_id
@@ -1623,6 +1771,7 @@ class CustomRouterContextEngine(ContextEngine):
                     )
                 except Exception as e:
                     logger.error(f"Compression catch-up reassign failed: {e}")
+                    raise
             try:
                 moved = self.store.reassign_session(old_session_id, session_id, interface=interface)
                 logger.info(
@@ -1630,14 +1779,20 @@ class CustomRouterContextEngine(ContextEngine):
                 )
             except Exception as e:
                 logger.error(f"Compression boundary reassign failed: {e}")
+                raise
             self.session_id = session_id
             # Sessions row for `session_id` is now created atomically inside
             # reassign_session() (A1) — no separate create_session() call
             # needed.
             # current_segment_id rebased inside reassign_session via REPLACE on
             # segment_id strings, so the in-memory pointer must follow:
-            if isinstance(self.current_segment_id, str) and old_session_id in self.current_segment_id:
-                self.current_segment_id = self.current_segment_id.replace(old_session_id, session_id)
+            rebased_segment = self.current_segment_id
+            if isinstance(rebased_segment, str) and old_session_id in rebased_segment:
+                rebased_segment = rebased_segment.replace(old_session_id, session_id)
+            saved_rebound_state = self.store.load_state(session_id)
+            if saved_rebound_state and saved_rebound_state.get("segment_id"):
+                rebased_segment = saved_rebound_state["segment_id"]
+            self.current_segment_id = rebased_segment
             self._current_state["session_id"] = session_id
             self._current_state["segment_id"] = self.current_segment_id
             # Hermes will hand us already-compacted messages from this point;
@@ -1752,6 +1907,7 @@ class CustomRouterContextEngine(ContextEngine):
         self._drop_pending_enrichment("on_session_start fresh")
         logger.info(f"Session started fresh: {session_id} on {interface}")
 
+    @_serialize_engine
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         self._native_request_cache = None
         logger.info(f"Session ended: {session_id}")
@@ -1760,6 +1916,7 @@ class CustomRouterContextEngine(ContextEngine):
         conn.commit()
         conn.close()
 
+    @_serialize_engine
     def on_session_reset(self) -> None:
         """Hermes invokes this from cli.reset_session_state() on /new and /reset.
 
@@ -1812,6 +1969,7 @@ class CustomRouterContextEngine(ContextEngine):
         status = super().get_status()
         status["engine_name"] = self.name
         status["db_path"] = self.store.db_path
+        status["budget_overflow"] = getattr(self, "_last_budget_overflow", None)
         return status
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

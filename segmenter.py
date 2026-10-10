@@ -4,7 +4,7 @@ import struct
 import logging
 import threading
 from collections import OrderedDict
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +17,10 @@ DEFAULT_CENTROID_WINDOW = 200       # 0 = no window, average all segment events
 
 
 class _CentroidCache:
-    """Thread-safe LRU cache of (segment_id -> (centroid_vector, fingerprint)).
-
-    Invalidation is by fingerprint — caller passes (event_count, window_size);
-    a change in either invalidates the entry.
-    """
+    """Thread-safe scoped centroid LRU, invalidated by SQLite commit revision."""
 
     def __init__(self, max_entries: int = DEFAULT_CENTROID_CACHE):
-        self._data: "OrderedDict[str, Tuple[List[float], Tuple[int, int]]]" = OrderedDict()
+        self._data = OrderedDict()
         self._lock = threading.Lock()
         self._max = max_entries
 
@@ -34,7 +30,7 @@ class _CentroidCache:
             while len(self._data) > self._max:
                 self._data.popitem(last=False)
 
-    def get(self, segment_id: str, fingerprint: Tuple[int, int]) -> Optional[List[float]]:
+    def get(self, segment_id, fingerprint: tuple) -> Optional[List[float]]:
         with self._lock:
             entry = self._data.get(segment_id)
             if entry is None:
@@ -45,7 +41,7 @@ class _CentroidCache:
             self._data.move_to_end(segment_id)
             return vec
 
-    def put(self, segment_id: str, vector: List[float], fingerprint: Tuple[int, int]):
+    def put(self, segment_id, vector: List[float], fingerprint: tuple):
         with self._lock:
             self._data[segment_id] = (vector, fingerprint)
             self._data.move_to_end(segment_id)
@@ -55,9 +51,6 @@ class _CentroidCache:
     def invalidate(self, segment_id: str):
         with self._lock:
             self._data.pop(segment_id, None)
-
-
-_centroid_cache = _CentroidCache()
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -79,12 +72,9 @@ class SessionSegmenter:
         self.indexer = indexer
         self.current_segment_id = current_segment_id
         self.segment_count = 0
+        self.session_id = None
+        self._centroid_local = threading.local()
         self.config = config
-        cache_size = self._cfg("centroid_cache_size", DEFAULT_CENTROID_CACHE)
-        try:
-            _centroid_cache.resize(int(cache_size))
-        except (TypeError, ValueError):
-            pass
         self._warned_segments: set = set()
 
     def _cfg(self, key: str, default):
@@ -94,45 +84,93 @@ class SessionSegmenter:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
+    def _model_id(self):
+        return getattr(self.indexer, "model_id", None) or self._cfg(
+            "embedding_model", "jina-embeddings-v5-text-small-retrieval-mlx")
+
+    def bind_session(self, session_id: Optional[str], segment_id: str):
+        """Restore binding and the highest allocated counter, including legacy resumes."""
+        if self.session_id == session_id and self.current_segment_id == segment_id:
+            return
+        self.session_id = session_id
+        self.current_segment_id = segment_id
+        if session_id is None:
+            self.segment_count = 0
+            return
+        pattern = re.compile(r"^seg_" + re.escape(session_id) + r"_(\d+)$")
+        counter = 0
+        conn = self.store._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("CREATE TABLE IF NOT EXISTS segment_sequences "
+                         "(session_id TEXT PRIMARY KEY, counter INTEGER NOT NULL)")
+            segments = [segment_id] + [r[0] for r in conn.execute(
+                "SELECT DISTINCT segment_id FROM events WHERE session_id=?", (session_id,))]
+            for candidate in segments:
+                match = pattern.match(candidate or "")
+                if match:
+                    counter = max(counter, int(match.group(1)))
+            conn.execute("INSERT INTO segment_sequences VALUES (?,?) "
+                         "ON CONFLICT(session_id) DO UPDATE SET counter=MAX(counter,excluded.counter)",
+                         (session_id, counter))
+            self.segment_count = conn.execute(
+                "SELECT counter FROM segment_sequences WHERE session_id=?", (session_id,)).fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _centroid_context(self):
+        # data_version is meaningful only on a persistent connection. A per-thread
+        # connection observes commits from all other connections without reading BLOBs.
+        local = self._centroid_local
+        if not hasattr(local, "connection"):
+            local.connection = self.store._get_connection()
+            local.cache = _CentroidCache()
+        return local.connection, local.cache
+
+    def close(self):
+        """Release the current thread's centroid reader (no transaction is retained)."""
+        local = self._centroid_local
+        if hasattr(local, "connection"):
+            local.connection.close()
+            del local.connection
+            del local.cache
+
     # ------------------------------------------------------------------
     # Centroid + drift
     # ------------------------------------------------------------------
 
     def _load_segment_embeddings(self, segment_id: str, window: int = 0) -> List[List[float]]:
-        """Pull embeddings for a segment from embedding_index.
-
-        window > 0 → only the last N embeddings (by events.timestamp DESC, then reversed).
-        window = 0 → all embeddings in segment.
-        """
-        try:
-            conn = self.store._get_connection()
-            if window and window > 0:
-                cursor = conn.execute(
-                    "SELECT i.embedding FROM embedding_index i "
-                    "JOIN events e ON i.event_id = e.id "
-                    "WHERE e.segment_id = ? AND i.embedding IS NOT NULL "
-                    "ORDER BY e.timestamp DESC LIMIT ?",
-                    (segment_id, window)
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT i.embedding FROM embedding_index i "
-                    "JOIN events e ON i.event_id = e.id "
-                    "WHERE e.segment_id = ? AND i.embedding IS NOT NULL",
-                    (segment_id,)
-                )
-            embeddings: List[List[float]] = []
-            for row in cursor:
-                blob = row[0]
-                if not blob:
-                    continue
-                emb_len = len(blob) // 4
-                embeddings.append(list(struct.unpack(f"{emb_len}f", blob)))
-            conn.close()
-            return embeddings
-        except Exception as e:
-            logger.warning(f"Failed to load segment embeddings for {segment_id}: {e}")
+        if not self.session_id:
             return []
+        conn = self.store._get_connection()
+        try:
+            sql = ("SELECT i.embedding FROM embedding_index i JOIN events e ON i.event_id=e.id "
+                   "WHERE e.session_id=? AND e.segment_id=? AND i.embedding_model_id=? "
+                   "AND i.embedding IS NOT NULL ORDER BY e.timestamp DESC, e.id DESC")
+            params = [self.session_id, segment_id, self._model_id()]
+            if window > 0:
+                sql += " LIMIT ?"
+                params.append(window)
+            embeddings = []
+            expected_dim = getattr(self.indexer, "embedding_dim", None)
+            for row in conn.execute(sql, params):
+                blob = row[0]
+                if not blob or len(blob) % 4:
+                    continue
+                dim = len(blob) // 4
+                if expected_dim is None:
+                    expected_dim = dim
+                if dim != expected_dim:
+                    logger.warning("Ignoring centroid vector with incompatible dimension: %s", dim)
+                    continue
+                embeddings.append(list(struct.unpack(f"{dim}f", blob)))
+            return embeddings
+        except Exception as exc:
+            logger.warning("Failed to load scoped segment embeddings: %s", exc)
+            return []
+        finally:
+            conn.close()
 
     def get_centroid(self, segment_id: str) -> Optional[List[float]]:
         """Return cached or freshly-computed centroid for a segment.
@@ -152,25 +190,26 @@ class SessionSegmenter:
         if window < 0:
             window = 0
 
-        # Total event count is part of cache fingerprint so a new event
-        # invalidates the cache even when the window stays full.
+        if not self.session_id:
+            return None
+        conn, cache = self._centroid_context()
+        cache.resize(self._cfg("centroid_cache_size", DEFAULT_CENTROID_CACHE))
+        key = (self.session_id, segment_id, self._model_id(),
+               getattr(self.indexer, "embedding_dim", None))
+        fingerprint = (conn.execute("PRAGMA data_version").fetchone()[0],
+                       conn.total_changes, window)
+        cached = cache.get(key, fingerprint)
+        if cached is not None:
+            return cached
         total = self._segment_event_count(segment_id)
-        if total >= SEGMENT_LARGE_WARN and segment_id not in self._warned_segments:
-            logger.warning(
-                f"Segment {segment_id} has {total} events — drift detection may be tuned wrong "
-                f"(check drift_threshold). centroid_window={window} keeps centroid focused."
-            )
-            self._warned_segments.add(segment_id)
-
+        if total >= SEGMENT_LARGE_WARN and key not in self._warned_segments:
+            logger.warning("Segment %s/%s has %s events; centroid_window=%s",
+                           self.session_id, segment_id, total, window)
+            self._warned_segments.add(key)
         embeddings = self._load_segment_embeddings(segment_id, window=window)
         n = len(embeddings)
         if n < COLD_START_MIN_EVENTS:
             return None
-
-        fingerprint = (total, window)
-        cached = _centroid_cache.get(segment_id, fingerprint)
-        if cached is not None:
-            return cached
 
         dim = len(embeddings[0])
         centroid = [0.0] * dim
@@ -178,7 +217,7 @@ class SessionSegmenter:
             for i, v in enumerate(emb):
                 centroid[i] += v
         centroid = [v / n for v in centroid]
-        _centroid_cache.put(segment_id, centroid, fingerprint)
+        cache.put(key, centroid, fingerprint)
         return centroid
 
     def calculate_embedding_drift(self, message: str, segment_id: str) -> float:
@@ -195,7 +234,7 @@ class SessionSegmenter:
         except Exception as e:
             logger.warning(f"Drift: failed to embed message: {e}")
             return 0.0
-        if not msg_emb:
+        if not msg_emb or len(msg_emb) != len(centroid):
             return 0.0
         similarity = _cosine(msg_emb, centroid)
         # cosine ∈ [-1, 1]; map to drift ∈ [0, 1] (higher = more different)
@@ -210,7 +249,8 @@ class SessionSegmenter:
         try:
             conn = self.store._get_connection()
             row = conn.execute(
-                "SELECT COUNT(*) FROM events WHERE segment_id = ?", (segment_id,)
+                "SELECT COUNT(*) FROM events WHERE session_id=? AND segment_id=?",
+                (self.session_id, segment_id)
             ).fetchone()
             conn.close()
             return int(row[0] or 0)
@@ -231,7 +271,7 @@ class SessionSegmenter:
         """
         switch_patterns = [
             r"let's switch to", r"forget that", r"new topic",
-            r"instead of that", r"давай переключимся", r"забудь это"
+            r"instead of that", r"давай переключимся", r"забудь это", r"новая тема"
         ]
         for p in switch_patterns:
             if re.search(p, message, re.IGNORECASE):
@@ -241,35 +281,53 @@ class SessionSegmenter:
 
     def calculate_drift_score(self, message: str, segment_id: str,
                                weights: List[float] = None,
-                               entity_signal: float = 0.0,
-                               explicit_signal: float = 0.0) -> float:
+                               entity_signal: Optional[float] = None,
+                               explicit_signal: Optional[float] = None) -> float:
         """Composite drift = w0*embedding_drift + w1*entity + w2*explicit.
 
-        entity_signal and explicit_signal are 0/1 floats from classifier;
-        when not supplied, only embedding drift contributes.
+        entity_signal and explicit_signal are optional normalized classifier signals;
+        when neither is supplied, use embedding drift directly (no absent-signal weight penalty).
         """
-        w = weights or DEFAULT_WEIGHTS
+        w = weights if weights is not None else self._cfg("drift_weights", DEFAULT_WEIGHTS)
         emb_drift = self.calculate_embedding_drift(message, segment_id)
-        score = w[0] * emb_drift + w[1] * entity_signal + w[2] * explicit_signal
+        if entity_signal is None and explicit_signal is None:
+            return emb_drift
+        score = w[0] * emb_drift + w[1] * (entity_signal or 0.) + w[2] * (explicit_signal or 0.)
         return min(max(score, 0.0), 1.0)
 
     def create_new_segment(self, session_id: str) -> str:
         old = self.current_segment_id
-        self.segment_count += 1
+        if self.session_id != session_id:
+            self.bind_session(session_id, f"seg_{session_id}_1")
+        conn = self.store._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE segment_sequences SET counter=counter+1 WHERE session_id=?", (session_id,))
+            self.segment_count = conn.execute(
+                "SELECT counter FROM segment_sequences WHERE session_id=?", (session_id,)).fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
         new_segment_id = f"seg_{session_id}_{self.segment_count}"
         self.current_segment_id = new_segment_id
-        _centroid_cache.invalidate(old)
         logger.info(f"New segment created: {new_segment_id} (previous: {old})")
         return new_segment_id
 
     def handle_new_message(self, session_id: str, message: str,
                            execution_state: Dict[str, Any]) -> str:
+        if self.session_id != session_id:
+            initial = self.current_segment_id if self.session_id is None and self.current_segment_id.startswith(
+                f"seg_{session_id}_") else f"seg_{session_id}_1"
+            self.bind_session(session_id, initial)
+        if not self._cfg("segmentation_enabled", True):
+            return self.current_segment_id
         if self.check_hard_triggers(message, execution_state.get("last_tool")):
             return self.create_new_segment(session_id)
 
         drift_score = self.calculate_drift_score(message, self.current_segment_id)
-        if drift_score > DRIFT_THRESHOLD:
-            logger.info(f"Drift trigger: score {drift_score:.2f} > {DRIFT_THRESHOLD} → new segment.")
+        threshold = self._cfg("drift_threshold", DRIFT_THRESHOLD)
+        if drift_score > threshold:
+            logger.info(f"Drift trigger: score {drift_score:.2f} > {threshold} → new segment.")
             return self.create_new_segment(session_id)
 
         return self.current_segment_id

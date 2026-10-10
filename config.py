@@ -1,4 +1,7 @@
 import os
+import copy
+import logging
+import math
 import yaml
 from typing import Any, Dict, Optional
 
@@ -40,6 +43,7 @@ DEFAULT_CONFIG = {
     "embedding_model": "jina-embeddings-v5-text-small-retrieval-mlx",
     "embedding_endpoint": "http://127.0.0.1:8000",
     "embedding_api_key": "1234",
+    "embedding_dim": 1024,
 
     # Segmentation
     # RU: Сегментация сессии — детектит смену темы и режет сессию на сегменты.
@@ -171,43 +175,80 @@ class PluginConfig:
     """Configuration manager for the context engine plugin."""
 
     def __init__(self, config_dict: Optional[Dict] = None):
-        self._config = DEFAULT_CONFIG.copy()
-        if config_dict:
-            self._config.update(config_dict)
-        self._load_from_env()
+        self._config = copy.deepcopy(DEFAULT_CONFIG)
         self._load_from_yaml()
+        self._load_from_env()
+        if config_dict:
+            self._apply(config_dict, "explicit")
+
+    def _apply(self, values, source):
+        if not isinstance(values, dict):
+            logging.getLogger(__name__).warning("Ignoring non-mapping %s configuration", source)
+            return
+        for key, value in values.items():
+            if key not in DEFAULT_CONFIG:
+                self._config[key] = value
+                continue
+            try:
+                default = DEFAULT_CONFIG[key]
+                if key == "active_window_tokens" and value is None:
+                    value = 0
+                elif isinstance(default, bool):
+                    if isinstance(value, str):
+                        normalized = value.lower().strip()
+                        if normalized not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+                            raise ValueError("invalid boolean")
+                        value = normalized in ("1", "true", "yes", "on")
+                    elif not isinstance(value, bool):
+                        raise ValueError("expected boolean")
+                elif isinstance(default, int):
+                    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+                        raise ValueError("expected integer")
+                    value = int(value)
+                    if value < 0 or key == "embedding_dim" and value == 0:
+                        raise ValueError("out of bounds")
+                elif isinstance(default, float):
+                    value = float(value)
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("out of bounds")
+                    if key.endswith("ratio") or key in ("context_window_usage_percent", "dependency_decay"):
+                        if value > 1:
+                            raise ValueError("out of bounds")
+                    if key == "drift_threshold" and value > 1:
+                        raise ValueError("out of bounds")
+                elif isinstance(default, list):
+                    if isinstance(value, str):
+                        value = [item.strip() for item in value.split(",") if item.strip()]
+                    if not isinstance(value, list):
+                        raise ValueError("expected list")
+                    if default and isinstance(default[0], str):
+                        if not all(isinstance(item, str) for item in value):
+                            raise ValueError("expected strings")
+                    else:
+                        value = [float(item) for item in value]
+                        if len(value) != len(default) or any(not math.isfinite(item) or item < 0 for item in value) or sum(value) <= 0:
+                            raise ValueError("invalid weights")
+                elif not isinstance(value, str):
+                    raise ValueError("expected string")
+                self._config[key] = value
+            except (ValueError, TypeError, OverflowError):
+                # Never echo a value: configuration can contain API keys.
+                logging.getLogger(__name__).warning("Ignoring invalid %s configuration for %s", source, key)
 
     def _load_from_env(self):
-        """Load config from HERMES_CTX_* environment variables."""
-        prefix = "HERMES_CTX_"
-        for key in self._config.keys():
-            env_key = prefix + key.upper()
-            value = os.environ.get(env_key)
-            if value is not None:
-                # Convert type
-                if isinstance(self._config[key], bool):
-                    self._config[key] = value.lower() in ("1", "true", "yes", "on")
-                elif isinstance(self._config[key], int):
-                    self._config[key] = int(value)
-                elif isinstance(self._config[key], float):
-                    self._config[key] = float(value)
-                elif isinstance(self._config[key], list):
-                    # Simple CSV parse
-                    self._config[key] = [float(x.strip()) for x in value.split(",")]
-                else:
-                    self._config[key] = value
+        """Environment overrides YAML; explicit constructor values override both."""
+        values = {key: os.environ["HERMES_CTX_" + key.upper()]
+                  for key in DEFAULT_CONFIG if "HERMES_CTX_" + key.upper() in os.environ}
+        self._apply(values, "environment")
 
     def _load_from_yaml(self):
-        """Load config from config.yaml in the plugin directory."""
         yaml_path = os.path.join(PLUGIN_DIR, "config.yaml")
         if os.path.exists(yaml_path):
             try:
                 with open(yaml_path, "r") as f:
-                    user_config = yaml.safe_load(f)
-                    if user_config:
-                        self._config.update(user_config)
-            except Exception as e:
-                logging.getLogger(__name__).error(f"Failed to load YAML config: {e}")
+                    self._apply(yaml.safe_load(f) or {}, "YAML")
+            except Exception:
+                logging.getLogger(__name__).warning("Failed to load YAML configuration")
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._config.get(key, default)

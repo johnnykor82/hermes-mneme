@@ -4,6 +4,7 @@ import json
 import hashlib
 import datetime
 import logging
+import re
 from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -19,8 +20,11 @@ except ImportError:
 class ContextStore:
     """Manages the SQLite database for the context engine plugin."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, embedding_dim: int = 1024):
         self.db_path = db_path
+        self.embedding_dim = int(embedding_dim)
+        if self.embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
         self._init_db()
 
     def _get_connection(self, load_vec: bool = False):
@@ -82,6 +86,14 @@ class ContextStore:
         )
         """)
 
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        if "tool_call_id" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN tool_call_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session_segment_time "
+                     "ON events(session_id,segment_id,timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session_time "
+                     "ON events(session_id,timestamp)")
+
         # Embedding Index (Component 2 + Change 1)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS embedding_index (
@@ -101,9 +113,9 @@ class ContextStore:
                 conn.enable_load_extension(True)
                 sqlite_vec.load(conn)
                 conn.enable_load_extension(False)
-                cursor.execute("""
+                cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                    embedding float[1024]
+                    embedding float[{self.embedding_dim}]
                 );
                 """)
             except Exception as _vec_err:
@@ -120,6 +132,9 @@ class ContextStore:
             segment_id TEXT NOT NULL
         );
         """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vec_meta_event_model "
+                       "ON vec_items_meta(event_id,embedding_model_id)")
 
         # Execution State (Component 3)
         cursor.execute("""
@@ -202,6 +217,17 @@ class ContextStore:
         h.update(b"\x00")
         h.update((content or "").encode("utf-8"))
         return h.hexdigest()
+
+    def existing_event_id(self, event_ids: List[str], session_id: str) -> Optional[str]:
+        conn = self._get_connection()
+        try:
+            for event_id in event_ids:
+                if conn.execute("SELECT 1 FROM events WHERE id=? AND session_id=?",
+                                (event_id, session_id)).fetchone():
+                    return event_id
+            return None
+        finally:
+            conn.close()
 
     def session_exists(self, session_id: str) -> Optional[str]:
         """Returns the session's status string if present in the sessions table,
@@ -412,7 +438,8 @@ class ContextStore:
 
     def add_event(self, session_id: str, segment_id: str, event_type: str, role: str,
                   content: str, tool_name: Optional[str] = None, tool_input: Optional[Dict] = None,
-                  token_estimate: int = 0, event_id: Optional[str] = None) -> Tuple[str, bool]:
+                  token_estimate: int = 0, event_id: Optional[str] = None,
+                  tool_call_id: Optional[str] = None) -> Tuple[str, bool]:
         """Insert an event. If event_id is provided (deterministic), uses
         INSERT OR IGNORE and returns (event_id, inserted_flag) — inserted_flag
         is False when the row already existed (idempotent re-ingest).
@@ -421,11 +448,11 @@ class ContextStore:
         always returns inserted_flag=True."""
         if event_id is None:
             event_id = str(uuid.uuid4())
-            sql = """INSERT INTO events (id, session_id, segment_id, timestamp, type, role, content, tool_name, tool_input, token_estimate)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            sql = """INSERT INTO events (id, session_id, segment_id, timestamp, type, role, content, tool_name, tool_input, token_estimate, tool_call_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         else:
-            sql = """INSERT OR IGNORE INTO events (id, session_id, segment_id, timestamp, type, role, content, tool_name, tool_input, token_estimate)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            sql = """INSERT OR IGNORE INTO events (id, session_id, segment_id, timestamp, type, role, content, tool_name, tool_input, token_estimate, tool_call_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
 
         conn = self._get_connection()
@@ -448,7 +475,7 @@ class ContextStore:
         cur = conn.execute(
             sql,
             (event_id, session_id, segment_id, now, event_type, role, content, tool_name,
-             json.dumps(tool_input) if tool_input else None, token_estimate)
+             json.dumps(tool_input) if tool_input else None, token_estimate, tool_call_id)
         )
         inserted = cur.rowcount > 0
         conn.commit()
@@ -649,6 +676,7 @@ class ContextStore:
         conn = self._get_connection()
         total = 0
         try:
+            conn.execute("BEGIN IMMEDIATE")
             now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
             # Materialize sessions row for new_session_id FIRST so any FK-like
             # check or subsequent reader sees a consistent state.
@@ -658,36 +686,60 @@ class ContextStore:
                 "VALUES (?, ?, ?, ?, ?, 'active')",
                 (new_session_id, old_session_id, interface, now, now),
             )
-            # Update events.session_id
-            cur = conn.execute("UPDATE events SET session_id = ? WHERE session_id = ?",
-                             (new_session_id, old_session_id))
+            # Scope all metadata updates through the moved event IDs. A substring
+            # match on metadata alone can rewrite a completely unrelated session.
+            segments = [r[0] for r in conn.execute(
+                "SELECT DISTINCT segment_id FROM events WHERE session_id=?", (old_session_id,))]
+            occupied = {r[0] for r in conn.execute(
+                "SELECT DISTINCT segment_id FROM events WHERE session_id=?", (new_session_id,))}
+            mapping = {}
+            numeric = re.compile(r"^seg_" + re.escape(new_session_id) + r"_(\d+)$")
+            counter = max([int(m.group(1)) for value in occupied
+                           if (m := numeric.match(value))] or [0])
+            prefix = f"seg_{old_session_id}_"
+            for segment in segments:
+                suffix = segment[len(prefix):] if segment.startswith(prefix) else "legacy1"
+                target = f"seg_{new_session_id}_{suffix}"
+                if target in occupied:
+                    counter += 1
+                    target = f"seg_{new_session_id}_{counter}"
+                    while target in occupied:
+                        counter += 1
+                        target = f"seg_{new_session_id}_{counter}"
+                occupied.add(target)
+                match = numeric.match(target)
+                if match:
+                    counter = max(counter, int(match.group(1)))
+                mapping[segment] = target
+            conn.execute("CREATE TEMP TABLE segment_rebind_map "
+                         "(source TEXT PRIMARY KEY,target TEXT NOT NULL)")
+            conn.executemany("INSERT INTO segment_rebind_map VALUES (?,?)", mapping.items())
+            for table in ("embedding_index", "vec_items_meta"):
+                conn.execute(f"UPDATE {table} SET segment_id=(SELECT m.target FROM events e "
+                             f"JOIN segment_rebind_map m ON m.source=e.segment_id WHERE e.id={table}.event_id "
+                             "AND e.session_id=?) WHERE event_id IN "
+                             "(SELECT id FROM events WHERE session_id=?)",
+                             (old_session_id, old_session_id))
+            conn.execute("UPDATE events SET segment_id=(SELECT target FROM segment_rebind_map "
+                         "WHERE source=events.segment_id) WHERE session_id=?", (old_session_id,))
+            cur = conn.execute("UPDATE events SET session_id=? WHERE session_id=?",
+                               (new_session_id, old_session_id))
             total += cur.rowcount or 0
-            # Rebase segment_id so retrieval that filters by current segment finds
-            # inherited events (their segment_id was seg_{old_session}_N).
-            conn.execute(
-                "UPDATE events SET segment_id = REPLACE(segment_id, ?, ?) WHERE session_id = ? AND segment_id LIKE ?",
-                (old_session_id, new_session_id, new_session_id, f"%{old_session_id}%")
-            )
-            # Mirror the rebase in vec_items_meta (its segment_id was set at insert time).
-            conn.execute(
-                "UPDATE vec_items_meta SET segment_id = REPLACE(segment_id, ?, ?) WHERE segment_id LIKE ?",
-                (old_session_id, new_session_id, f"%{old_session_id}%")
-            )
-            # And in embedding_index.
-            conn.execute(
-                "UPDATE embedding_index SET segment_id = REPLACE(segment_id, ?, ?) WHERE segment_id LIKE ?",
-                (old_session_id, new_session_id, f"%{old_session_id}%")
-            )
-            # embedding_index and vec_items_meta inherit implicitly via event_id —
-            # no session_id column on them.
-            # Update execution_graph
-            cur = conn.execute("UPDATE execution_graph SET session_id = ? WHERE session_id = ?",
-                             (new_session_id, old_session_id))
+            cur = conn.execute("UPDATE execution_graph SET session_id=? WHERE session_id=?",
+                               (new_session_id, old_session_id))
             total += cur.rowcount or 0
-            # Update execution_state
-            cur = conn.execute("UPDATE OR REPLACE execution_state SET session_id = ? WHERE session_id = ?",
-                             (new_session_id, old_session_id))
-            total += cur.rowcount or 0
+            saved = conn.execute("SELECT state_json FROM execution_state WHERE session_id=?",
+                                 (old_session_id,)).fetchone()
+            if saved:
+                state = json.loads(saved[0])
+                state["session_id"] = new_session_id
+                state["segment_id"] = mapping.get(state.get("segment_id"), state.get("segment_id"))
+                conn.execute("DELETE FROM execution_state WHERE session_id=?", (old_session_id,))
+                conn.execute("INSERT OR REPLACE INTO execution_state VALUES (?,?,?)",
+                             (new_session_id, json.dumps(state), now))
+                total += 1
+            conn.execute("UPDATE state_history SET session_id=? WHERE session_id=?",
+                         (new_session_id, old_session_id))
             # Record lineage
             conn.execute("INSERT OR IGNORE INTO session_lineage (old_session_id, new_session_id, created_at) VALUES (?, ?, ?)",
                         (old_session_id, new_session_id, now))
@@ -699,6 +751,7 @@ class ContextStore:
         except Exception as e:
             logger.error(f"Failed to reassign session: {e}")
             conn.rollback()
+            raise
         finally:
             conn.close()
         return total

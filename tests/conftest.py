@@ -88,3 +88,15 @@ if _PKG_NAME not in sys.modules:
     module = importlib.util.module_from_spec(spec)
     sys.modules[_PKG_NAME] = module
     spec.loader.exec_module(module)
+
+
+import pytest
+import requests
+
+
+@pytest.fixture(autouse=True)
+def _offline_http_only(monkeypatch):
+    """Tests may mock HTTP responses, but must never reach real endpoints."""
+    def blocked_request(*args, **kwargs):
+        raise RuntimeError("External HTTP is disabled in the offline test suite")
+    monkeypatch.setattr(requests.sessions.Session, "request", blocked_request)

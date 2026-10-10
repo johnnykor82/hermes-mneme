@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-10
+
+### Fixed
+- Session/segment/state lifecycle binding, persistent atomic counters, session/model/dimension scoped centroids and cache invalidation after background embeddings.
+- Scoped exact vector recall before top-k, per-instance embedding endpoint/model/key/dimension, idempotent vec mappings and metadata after asynchronous reassignment.
+- Configuration precedence and typed environment lists; effective segmentation settings.
+- Current-topic tool filtering, mixed assistant text/tool events, provider-ID graph matching through restart/compression, replay deduplication and reset/ingestion serialization.
+- Explicit estimated prompt overflow with complete field counting and atomic tool groups; current Hermes fail-open fallback remains a documented host limitation.
+
+### Added
+- Explicit read-only migration dry-run and atomic session-scoped legacy segment migration requiring SQLite backup API backup; protected-data digests, integrity checks and rollback tests.
+- Offline regressions, independent review, full findings/acceptance report, 100k/1M diagnostic benchmarks and Linux/macOS CI matrix.
+
+### Compatibility notes
+- Embedding-only threshold now applies to normalized drift directly; real semantic calibration remains pending. Global recall requires `segment='all'` and may be expensive on large DBs.
+- No automatic historical segment migration, semantic resegmentation or deletion; no Gateway Hygiene or model routing changes.
+
 ## [0.4.0] - 2026-09-16
 
 ### Added
