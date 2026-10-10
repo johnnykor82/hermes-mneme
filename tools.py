@@ -256,6 +256,11 @@ class ContextTools:
         segment = args.get("segment", "current")
         session = args.get("session", "current")
 
+        if "top_k" in args:
+            return json.dumps({"error": 'Use k, not top_k. Example: {"k": 30}.'})
+        if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 0):
+            return json.dumps({"error": 'k must be a non-negative integer or null. Use a JSON number, not a string. Example: {"k": 30}.'})
+
         if not query:
             # Fix C: surface the full args dict at WARNING level so an
             # operator can tell whether the LLM sent ``{}``, ``{"query":
