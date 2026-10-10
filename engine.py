@@ -638,6 +638,8 @@ class CustomRouterContextEngine(ContextEngine):
             self._last_enrichment_turn = turn
         try:
             if self.session_id:
+                if self._event_id_nonce:
+                    self._current_state["_event_id_nonce"] = self._event_id_nonce
                 self.store.commit_state(self.session_id, self._current_state)
         except Exception as e:
             logger.warning(f"Enricher: commit_state after merge failed: {e}")
@@ -1008,7 +1010,6 @@ class CustomRouterContextEngine(ContextEngine):
                     pass
                 if saved_state:
                     self._current_state = saved_state
-                    self._event_id_nonce = saved_state.get("_event_id_nonce")
                     self._current_state["session_id"] = hermes_sid
                     self._current_state["segment_id"] = self.current_segment_id
                 else:
@@ -1019,6 +1020,7 @@ class CustomRouterContextEngine(ContextEngine):
                     self._current_state = recovered or self._make_default_state(
                         hermes_sid, self.current_segment_id
                     )
+                self._event_id_nonce = self._current_state.get("_event_id_nonce")
                 self._processed_msg_count = 0
                 self._binding_origin_idx = 0
                 self._last_enrichment_turn = -1
@@ -1307,6 +1309,8 @@ class CustomRouterContextEngine(ContextEngine):
             # atomically in one transaction so they cannot diverge on crash).
             # Done BEFORE the pass-through guard so ingest mutations survive
             # a pass-through return.
+            if self._event_id_nonce:
+                self._current_state["_event_id_nonce"] = self._event_id_nonce
             self.store.commit_state(self.session_id, self._current_state)
 
         if not assemble:
@@ -1872,7 +1876,6 @@ class CustomRouterContextEngine(ContextEngine):
                 logger.warning(f"on_session_start: load_state failed: {e}")
             if saved_state:
                 self._current_state = saved_state
-                self._event_id_nonce = saved_state.get("_event_id_nonce")
                 self._current_state["session_id"] = session_id
                 self._current_state["segment_id"] = self.current_segment_id
                 state_source = "execution_state"
@@ -1890,6 +1893,7 @@ class CustomRouterContextEngine(ContextEngine):
                 else:
                     self._current_state = self._make_default_state(session_id, self.current_segment_id)
                     state_source = "default"
+            self._event_id_nonce = self._current_state.get("_event_id_nonce")
             # The whole `messages` buffer Hermes will pass next is legitimate
             # tail; ingest from index 0 with deterministic IDs (dedupes on
             # re-write).

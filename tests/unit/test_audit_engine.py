@@ -178,6 +178,43 @@ def test_resume_restores_namespace_for_legacy_completion_after_replay(eng):
     assert eng.store.load_state('A')['turn_count'] == 5
 
 
+@pytest.mark.parametrize('target_status', ['fresh', 'closed'])
+def test_auto_fresh_rebind_persists_existing_event_namespace(eng, target_status):
+    request = {'role': 'user', 'content': 'repeat the access code'}
+    eng.on_session_start('A')
+    eng.on_turn_complete([request, {'role': 'assistant', 'content': 'old answer'}])
+    eng.on_session_start('A')
+    eng.select_context([request], conversation_messages=[request], incoming_message=request)
+    nonce = eng._event_id_nonce
+    if target_status == 'closed':
+        eng.store.create_session('B', 'test')
+        conn = eng.store._get_connection()
+        conn.execute("UPDATE sessions SET status='closed' WHERE session_id='B'")
+        conn.commit()
+        conn.close()
+    eng._pending_session_id = 'B'
+    ingest(eng, [{'role': 'user', 'content': 'a fresh request'}])
+    assert eng._event_id_nonce == nonce
+    assert eng.store.load_state('B')['_event_id_nonce'] == nonce
+
+
+@pytest.mark.parametrize('binding', ['hook', 'auto'])
+def test_resume_loads_namespace_from_resolved_recovery_state(eng, monkeypatch, binding):
+    eng.on_session_start('A')
+    ingest(eng, [{'role': 'user', 'content': 'unfinished request'}])
+    recovered = eng._make_default_state('A', 'seg_A_1')
+    recovered['_event_id_nonce'] = 'recovered-identity'
+    monkeypatch.setattr(eng.store, 'load_state', lambda sid: None)
+    monkeypatch.setattr(eng, '_recover_state_from_history', lambda *a: recovered)
+    if binding == 'hook':
+        eng.on_session_start('A')
+    else:
+        eng.session_id = None
+        eng._processed_msg_count = 0
+        ingest(eng, [])
+    assert eng._event_id_nonce == 'recovered-identity'
+
+
 def test_reset_waits_for_inflight_ingestion(eng, monkeypatch):
     import threading
     eng.on_session_start('A')
