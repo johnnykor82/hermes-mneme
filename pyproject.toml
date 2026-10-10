@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-mneme"
-version = "0.4.0"
+version = "0.5.0"
 description = "Retrieval-based context engine plugin for Hermes — execution-graph-aware memory replacement for the default compressor."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -35,5 +35,5 @@ Repository = "https://github.com/johnnykor82/hermes-mneme"
 py-modules = [
     "engine", "store", "index", "router", "classifier", "parser",
     "prompt_builder", "compressor", "enrichment", "segmenter",
-    "graph", "observability", "tools", "config",
+    "graph", "observability", "tools", "config", "migrations",
 ]
