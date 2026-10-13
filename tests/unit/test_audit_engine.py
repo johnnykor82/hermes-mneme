@@ -34,6 +34,7 @@ def test_bind_repairs_only_legacy_native_tool_pin_and_is_idempotent(eng):
         "parameters": {"type": "object", "properties": {}, "required": []},
     }} for s in original]
     stale[0]["function"].pop("parameters")
+    stale[0]["function"]["description"] = "Legacy guidance"
     other = {"type": "function", "function": {"name": "other", "input_schema": {"type": "object"}}}
     pin = {"version": "host-sha-unchanged", "tools": [other, *stale]}
     db = Mock()
@@ -47,6 +48,7 @@ def test_bind_repairs_only_legacy_native_tool_pin_and_is_idempotent(eng):
     for tool, schema in zip(repaired["tools"][1:], original):
         assert tool["function"]["parameters"] == schema["parameters"]
         assert "input_schema" not in tool["function"]
+        assert tool["function"]["description"] == schema["description"]
     db.get_session.return_value = {"tool_names": json.dumps(repaired)}
     db.update_session_tool_names.reset_mock()
     eng.bind_session_state(session_db=db, session_id="A")
@@ -597,3 +599,22 @@ def test_compression_preserves_pending_tool_decision_edges(eng):
     conn = eng.store._get_connection()
     assert conn.execute("SELECT COUNT(*) FROM execution_graph WHERE edge_type='decision'").fetchone()[0] == 1
     conn.close()
+
+
+def test_bind_refreshes_memory_guidance_in_existing_native_pin(eng):
+    schema = eng.get_tool_schemas()[0]
+    other = {'type': 'function', 'function': {'name': 'other', 'description': 'Keep me'}}
+    pin = {'version': 'same-host', 'tools': [other, {'type': 'function', 'function': {
+        **schema, 'description': 'Old semantic-only snippet guidance',
+    }}]}
+    db = Mock()
+    db.get_session.return_value = {'tool_names': json.dumps(pin)}
+    eng.bind_session_state(session_db=db, session_id='A')
+    updated = db.update_session_tool_names.call_args.args[1]
+    assert updated['version'] == 'same-host'
+    assert updated['tools'][0] == other
+    assert updated['tools'][1]['function'] == schema
+    db.get_session.return_value = {'tool_names': json.dumps(updated)}
+    db.update_session_tool_names.reset_mock()
+    eng.bind_session_state(session_db=db, session_id='A')
+    db.update_session_tool_names.assert_not_called()

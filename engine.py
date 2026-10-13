@@ -145,6 +145,10 @@ class CustomRouterContextEngine(ContextEngine):
 
         self._processed_msg_count = 0
         self._native_request_cache = None
+        self._active_turn_key = None
+        self._active_turn_start_index = None
+        self._active_turn_event_ids = set()
+        self._last_native_turn_uid = None
         # A5: cached session_id from on_session_start, used by compress() if
         # hermes_logging._session_context is unavailable.
         self._pending_session_id: Optional[str] = None
@@ -826,6 +830,72 @@ class CustomRouterContextEngine(ContextEngine):
             return "prepare_request_messages"
         return None
 
+    def _clear_active_turn(self) -> None:
+        self._active_turn_key = None
+        self._active_turn_start_index = None
+        self._active_turn_event_ids.clear()
+
+    def _bind_native_turn(self, messages, incoming_message) -> None:
+        """Use the host's original incoming message, not synthetic user rows."""
+        if not isinstance(incoming_message, dict) or incoming_message.get("role") != "user":
+            self._clear_active_turn()
+            return
+        uid = incoming_message.get("message_uid")
+        uid = uid if isinstance(uid, str) and uid else None
+        position = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            absorbed = msg.get("_absorbed_message_uids")
+            if uid and (msg.get("message_uid") == uid or
+                        isinstance(absorbed, list) and uid in absorbed):
+                position = idx
+                break
+            if not uid and msg == incoming_message:
+                if position is not None:
+                    position = None  # Equal text alone cannot identify an occurrence.
+                    break
+                position = idx
+        if position is None:
+            self._clear_active_turn()
+            return
+        if (uid and self._last_native_turn_uid is not None and
+                uid != self._last_native_turn_uid and position == len(messages) - 1 and
+                position < self._processed_msg_count):
+            # A failed host turn can reuse a buffer slot without completing.
+            # Distinct durable incoming UIDs prove a new occurrence even when
+            # its text and position are identical to the previous question.
+            self._processed_msg_count = position
+            self._native_request_cache = None
+        self._last_native_turn_uid = uid
+        key = ("uid", uid) if uid else ("index", position, incoming_message)
+        if self._active_turn_key != key:
+            self._active_turn_event_ids.clear()
+            self._active_turn_key = copy.deepcopy(key)
+        # Compaction may shift the same host incoming message in its buffer.
+        self._active_turn_start_index = position
+
+    @_serialize_engine
+    def get_active_turn_event_ids(self) -> List[str]:
+        """Actual stored IDs belonging to the active native logical turn."""
+        if self._active_turn_key is None or not self.session_id:
+            return []
+        ids = sorted(self._active_turn_event_ids)
+        found = []
+        conn = self.store._get_connection()
+        try:
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                found.extend(row["id"] for row in conn.execute(
+                    f"SELECT id FROM events WHERE session_id=? AND id IN ({placeholders})",
+                    [self.session_id, *batch],
+                ))
+        finally:
+            conn.close()
+        return sorted(found)
+
     def _native_hooks_available(self) -> bool:
         """True when the host Hermes supports native observe + request hooks."""
         return (
@@ -848,12 +918,15 @@ class CustomRouterContextEngine(ContextEngine):
         self._native_request_cache = None
         if not self._native_hooks_available():
             return None
-        self._process_context_messages(
-            messages,
-            current_tokens=None,
-            assemble=False,
-            caller="on_turn_complete",
-        )
+        try:
+            self._process_context_messages(
+                messages,
+                current_tokens=None,
+                assemble=False,
+                caller="on_turn_complete",
+            )
+        finally:
+            self._clear_active_turn()
         return None
 
     def select_context(
@@ -919,6 +992,8 @@ class CustomRouterContextEngine(ContextEngine):
             or getattr(getattr(self, "agent", None), "session_id", None)
             or self.session_id
         )
+        source_messages = conversation_messages if conversation_messages is not None else request_messages
+        self._bind_native_turn(source_messages or [], incoming_message)
         cache_key = [
             self.session_id, host_session_id, self._budget_tokens, budget_tokens,
             request_messages, conversation_messages, incoming_message,
@@ -928,7 +1003,6 @@ class CustomRouterContextEngine(ContextEngine):
             return copy.deepcopy(cached[1])
         self._native_request_cache = None
         cache_key = copy.deepcopy(cache_key)
-        source_messages = conversation_messages if conversation_messages is not None else request_messages
         if not source_messages:
             return None
         new_user_input = (
@@ -1329,6 +1403,9 @@ class CustomRouterContextEngine(ContextEngine):
                         existing_id = None if current_incoming else (
                             replay_ids.get(replay_key) or self._existing_replay_id(ev, msg_idx, sub_idx, lineage))
                         if existing_id:
+                            if (self._active_turn_start_index is not None and
+                                    msg_idx >= self._active_turn_start_index):
+                                self._active_turn_event_ids.add(existing_id)
                             if (ev["type"] == "tool_call" and ev.get("tool_call_id")
                                     and existing_id in self._legacy_tool_calls):
                                 # Restore an unfinished legacy call's provider
@@ -1343,6 +1420,9 @@ class CustomRouterContextEngine(ContextEngine):
                             token_estimate=ev["token_estimate"], event_id=det_id,
                             tool_call_id=ev.get("tool_call_id"),
                         )
+                        if (self._active_turn_start_index is not None and
+                                msg_idx >= self._active_turn_start_index):
+                            self._active_turn_event_ids.add(event_id)
                         if not inserted:
                             continue
 
@@ -1859,6 +1939,9 @@ class CustomRouterContextEngine(ContextEngine):
         self._replay_pending = True
         self._resume_replay_pending = False
         boundary_reason = str(kwargs.get("boundary_reason") or "")
+        if boundary_reason != "compression":
+            self._clear_active_turn()
+            self._last_native_turn_uid = None
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self.session_id
         interface = kwargs.get("platform", "unknown")
@@ -2036,6 +2119,9 @@ class CustomRouterContextEngine(ContextEngine):
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         self._native_request_cache = None
         logger.info(f"Session ended: {session_id}")
+        if session_id == self.session_id:
+            self._clear_active_turn()
+            self._last_native_turn_uid = None
         conn = self.store._get_connection()
         conn.execute("UPDATE sessions SET status='closed' WHERE session_id=?", (session_id,))
         conn.commit()
@@ -2062,6 +2148,8 @@ class CustomRouterContextEngine(ContextEngine):
         self._event_id_nonce = None
         super().on_session_reset()
         previous = self.session_id
+        self._clear_active_turn()
+        self._last_native_turn_uid = None
         logger.info(f"on_session_reset: clearing in-memory binding (was session_id={previous!r})")
         self.session_id = None
         self.current_segment_id = "seg_unbound"
@@ -2100,7 +2188,7 @@ class CustomRouterContextEngine(ContextEngine):
         return status
 
     def bind_session_state(self, *, session_db=None, session_id=None):
-        """Repair pre-0.5.2 native schemas frozen in Hermes' session tool pin."""
+        """Repair legacy schemas and refresh memory guidance in host tool pins."""
         if session_db is None or not session_id:
             return
         getter = getattr(session_db, "get_session", None)
@@ -2114,11 +2202,17 @@ class CustomRouterContextEngine(ContextEngine):
             return
         if not isinstance(pin, dict) or not isinstance(pin.get("tools"), list):
             return
-        names = {s["name"] for s in self.get_tool_schemas()}
+        schemas = {s["name"]: s for s in self.get_tool_schemas()}
         changed = False
         for tool in pin["tools"]:
             fn = tool.get("function") if isinstance(tool, dict) else None
-            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or fn["name"] not in names:
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or fn["name"] not in schemas:
+                continue
+            current = schemas[fn["name"]]
+            if fn.get("parameters") == current["parameters"]:
+                if fn.get("description") != current["description"]:
+                    fn["description"] = current["description"]
+                    changed = True
                 continue
             old = fn.get("input_schema")
             params = fn.get("parameters")
@@ -2127,6 +2221,7 @@ class CustomRouterContextEngine(ContextEngine):
             if params is not None and params != {"type": "object", "properties": {}, "required": []}:
                 continue
             fn["parameters"] = fn.pop("input_schema")
+            fn["description"] = current["description"]
             changed = True
         if changed:
             setter(session_id, pin)

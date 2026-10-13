@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3 — 2026-10-13
+
+- Combine semantic and BM25 lexical candidates using reciprocal rank fusion and bounded reranking for distant memory.
+- Show query-relevant excerpts with source role, session, segment and truncation metadata; preserve structured result identity when fetching and expanding source evidence.
+- Exclude the current logical turn across native synthetic continuations and keep segment expansion scoped to its source session.
+- Add generic guidance to search user statements and fetch primary evidence before attributing remembered facts.
+- Build the derived FTS index atomically on first use without migrating or rewriting historical events. Keep the accepted 0.5.2 context architecture and drift configuration.
+- Add hybrid retrieval, source excerpt, turn exclusion, expansion scope and memory guidance regressions.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
