@@ -67,6 +67,8 @@ Key knobs:
 
 `context_search(query='...', segment='current', session='current')` searches only the active topic. Use `segment='all'` for all topics and both `segment='all', session='all'` for explicit global recall. Global exact/unlimited searches can be expensive on large databases.
 
+Memory-tool search combines semantic similarity and BM25, fuses their rankings, and reranks a bounded candidate pool before applying `k`. Results expose source roles, actual segment IDs and truncation, with query-relevant historical excerpts. Verify factual answers with `fetch_event`; ranking alone does not establish which proposal was accepted. Native search exclusions follow the original logical turn across synthetic continuations. Segment expansion resolves its source session and reports skeleton incompleteness; shared legacy segment IDs require a seed event. The derived FTS index is built atomically on first use and adds initial latency and disk usage without changing original events. See [retrieval behavior](docs/memory-retrieval.md).
+
 Impossible estimated prompt budgets raise `PromptBudgetExceeded` with `actual_tokens` and `budget_tokens`. The current Hermes host catches hook errors and falls back to its original request; provider limits still need host enforcement.
 
 Existing shared `seg_1` data is not renamed automatically. Use the [backed-up migration guide](docs/audit-migration.md) for dry-run, explicit application and rollback. See the [audit verification report](docs/AUDIT-2026-10-10.md) for confirmed findings, production-copy integrity, benchmarks and test limitations.

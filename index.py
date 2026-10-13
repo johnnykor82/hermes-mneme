@@ -43,6 +43,8 @@ class EmbeddingIndex:
                                    endpoint + ("/embeddings" if endpoint.endswith("/v1") else "/v1/embeddings"))
         self._embedding_cache = OrderedDict()
         self._embedding_cache_lock = threading.RLock()
+        self._lexical_ready = False
+        self._lexical_lock = threading.RLock()
         self._vec_dim = None
         self._vec_available = False
         self._init_vec_extension()
@@ -290,18 +292,139 @@ class EmbeddingIndex:
             return self._search_vec0_multi(query_emb, session_ids=session_ids, segment_id=segment_id, top_k=top_k)
         return self._search_python_multi(query_emb, session_ids=session_ids, segment_id=segment_id, top_k=top_k)
 
+    def _ensure_lexical_index(self):
+        """Build a derived FTS index lazily; original events remain untouched."""
+        with self._lexical_lock:
+            if self._lexical_ready:
+                return True
+            conn = self._get_connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='events_fts'").fetchone()
+                if not exists:
+                    conn.execute("CREATE VIRTUAL TABLE events_fts USING fts5(content, content='events', content_rowid='rowid', tokenize='unicode61')")
+                    conn.execute("CREATE TRIGGER events_fts_ai AFTER INSERT ON events BEGIN INSERT INTO events_fts(rowid,content) VALUES(new.rowid,new.content); END")
+                    conn.execute("CREATE TRIGGER events_fts_ad AFTER DELETE ON events BEGIN INSERT INTO events_fts(events_fts,rowid,content) VALUES('delete',old.rowid,old.content); END")
+                    conn.execute("CREATE TRIGGER events_fts_au AFTER UPDATE OF content ON events BEGIN INSERT INTO events_fts(events_fts,rowid,content) VALUES('delete',old.rowid,old.content); INSERT INTO events_fts(rowid,content) VALUES(new.rowid,new.content); END")
+                    conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
+                conn.commit()
+                self._lexical_ready = True
+                return True
+            except Exception as exc:
+                conn.rollback()
+                logger.warning("Lexical index unavailable; retaining semantic search: %s", exc)
+                return False
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _lexical_query(query_text):
+        # Plain Unicode terms are quoted, never interpreted as FTS operators.
+        # Porter is deliberately absent: its stemmer is English, not Russian.
+        stop = set("а без в во вот все всё вы да для до его ее её если есть же за и из или их к как ко когда ли мы на над не но о об от по под при с со так то тот у уже что это я мне меня мой моя мои нашу нашем какой какая какие какую какого каким сколько напомни возвращаюсь прежде всего тогда том этом после хотел хотела просил просила".split())
+        terms = list(dict.fromkeys(word for word in re.findall(r"\w+", query_text.casefold())
+                                   if len(word) > 2 and word not in stop))[:40]
+        return " OR ".join('"' + word + '"' for word in terms)
+
+    @staticmethod
+    def _scope_sql(session_ids, segment_id, exclude_event_ids):
+        clauses, params = [], []
+        if session_ids is not None:
+            clauses.append("e.session_id IN (" + ",".join("?" for _ in session_ids) + ")")
+            params.extend(session_ids)
+        if segment_id and segment_id != "all":
+            clauses.append("e.segment_id=?")
+            params.append(segment_id)
+        if exclude_event_ids:
+            clauses.append("e.id NOT IN (" + ",".join("?" for _ in exclude_event_ids) + ")")
+            params.extend(exclude_event_ids)
+        return (" AND " + " AND ".join(clauses) if clauses else ""), params
+
+    def search_hybrid(self, query_text, session_ids=None, segment_id=None, top_k=5,
+                      exclude_event_ids=None):
+        """Return a bounded evidence pool, before reranking/public top-k.
+
+        DEV comparison on an immutable real corpus selected semantic60 plus
+        lexical60, RRF60, then a pool of40. Explicit None/0 retains unlimited
+        results; the router still bounds its reranker request to40 documents.
+        Lexical facts do not require a completed embedding job.
+        """
+        if session_ids == []:
+            return []
+        if isinstance(session_ids, str):
+            session_ids = [session_ids]
+        if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0):
+            raise ValueError("top_k must be a non-negative integer or None")
+        excluded = list(dict.fromkeys(exclude_event_ids or []))
+        candidate_limit = max(60, top_k) if top_k else None
+        pool_limit = max(40, top_k) if top_k else None
+        query_emb = self.get_embedding(query_text)
+        semantic = []
+        if query_emb:
+            semantic = self._search_vec0_multi(query_emb, session_ids, segment_id,
+                                                candidate_limit, excluded)
+        lexical = []
+        match = self._lexical_query(query_text)
+        if match and self._ensure_lexical_index():
+            conn = self._get_connection()
+            try:
+                scope, params = self._scope_sql(session_ids, segment_id, excluded)
+                sql = "SELECT e.id FROM events_fts JOIN events e ON e.rowid=events_fts.rowid WHERE events_fts MATCH ?" + scope
+                sql += " ORDER BY bm25(events_fts), e.id"
+                params = [match] + params
+                if candidate_limit:
+                    sql += " LIMIT ?"
+                    params.append(candidate_limit)
+                lexical = [row[0] for row in conn.execute(sql, params)]
+            except Exception as exc:
+                logger.warning("Lexical search failed; retaining semantic candidates: %s", exc)
+            finally:
+                conn.close()
+        by_id = {row['event_id']: row for row in semantic}
+        fused = {}
+        for ranked in ([row['event_id'] for row in semantic], lexical):
+            for rank, event_id in enumerate(ranked, 1):
+                fused[event_id] = fused.get(event_id, 0.0) + 1.0 / (60 + rank)
+        ordered = sorted(fused, key=lambda event_id: (-fused[event_id], event_id))
+        if pool_limit:
+            ordered = ordered[:pool_limit]
+        if not ordered:
+            return []
+        conn = self._get_connection()
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = {}
+            # Explicit unlimited search must also work on SQLite builds with
+            # a small bound-variable limit; normal pools need only one batch.
+            for offset in range(0, len(ordered), 500):
+                chunk = ordered[offset:offset + 500]
+                rows.update({row['id']: dict(row) for row in conn.execute(
+                    "SELECT id,session_id,segment_id,type,content,timestamp,tool_name FROM events WHERE id IN (" + ",".join("?" for _ in chunk) + ")", chunk)})
+            output = []
+            for event_id in ordered:
+                if event_id not in rows:
+                    continue
+                row = rows[event_id]
+                output.append(dict(row, event_id=event_id,
+                                   similarity=by_id.get(event_id, {}).get('similarity'),
+                                   embedding_model_id=by_id.get(event_id, {}).get('embedding_model_id'),
+                                   retrieval_score=fused[event_id]))
+            return output
+        finally:
+            conn.close()
+
     def _valid_embedding(self, embedding):
         return (isinstance(embedding, (list, tuple)) and len(embedding) == self.embedding_dim
                 and all(isinstance(value, (int, float)) and math.isfinite(value) for value in embedding))
 
-    def _search_vec0_multi(self, query_emb, session_ids, segment_id, top_k):
+    def _search_vec0_multi(self, query_emb, session_ids, segment_id, top_k, exclude_event_ids=None):
         """Exact sqlite-vec cosine over SQL-scoped canonical vectors before top-k.
 
         Scalar distance has no global KNN candidate limit, so filtering cannot
         discard the requested session. Python remains the exhaustive oracle.
         """
         if not self._vec_available:
-            return self._search_python_multi(query_emb, session_ids, segment_id, top_k)
+            return self._search_python_multi(query_emb, session_ids, segment_id, top_k, exclude_event_ids)
         if session_ids == [] or not self._valid_embedding(query_emb) or not any(query_emb):
             return []
         if top_k is not None and (not isinstance(top_k, int) or top_k < 0):
@@ -320,6 +443,9 @@ class EmbeddingIndex:
             if segment_id and segment_id != "all":
                 sql += " AND e.segment_id=?"
                 params.append(segment_id)
+            if exclude_event_ids:
+                sql += " AND e.id NOT IN (" + ",".join("?" for _ in exclude_event_ids) + ")"
+                params.extend(exclude_event_ids)
             sql += " ORDER BY similarity DESC, e.id DESC"
             if top_k:
                 sql += " LIMIT ?"
@@ -329,12 +455,12 @@ class EmbeddingIndex:
                     for row in conn.execute(sql, params)]
         except Exception as exc:
             logger.warning("Scoped sqlite-vec cosine failed; using Python: %s", exc)
-            return self._search_python_multi(query_emb, session_ids, segment_id, top_k)
+            return self._search_python_multi(query_emb, session_ids, segment_id, top_k, exclude_event_ids)
         finally:
             conn.close()
 
     def _search_python_multi(self, query_emb: List[float], session_ids: Optional[List[str]],
-                             segment_id: Optional[str], top_k: Optional[int]) -> List[Dict[str, Any]]:
+                             segment_id: Optional[str], top_k: Optional[int], exclude_event_ids=None) -> List[Dict[str, Any]]:
         if session_ids == [] or not self._valid_embedding(query_emb):
             return []
         if top_k is not None and (not isinstance(top_k, int) or top_k < 0):
@@ -354,6 +480,9 @@ class EmbeddingIndex:
             if segment_id and segment_id != "all":
                 sql += " AND e.segment_id=?"
                 params.append(segment_id)
+            if exclude_event_ids:
+                sql += " AND e.id NOT IN (" + ",".join("?" for _ in exclude_event_ids) + ")"
+                params.extend(exclude_event_ids)
 
             def candidates():
                 for event_id, blob, ev_type, model_id, seg_id, sess_id in conn.execute(sql, params):

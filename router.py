@@ -471,6 +471,52 @@ class ContextRouter:
             return 0.0
         return float(dep_bonuses.get(event_id, 0.0))
 
+    def rerank_search(self, query: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Rerank a tool-search evidence pool without mixing score scales.
+
+        Unlike automatic prompt routing, memory tools previously bypassed the
+        configured reranker. The real DEV benchmark preserved quality with40
+        head2000 documents. Explicit unlimited requests keep the remaining
+        fused candidates, without an unbounded HTTP rerank payload.
+        """
+        endpoint = self._cfg("reranker_endpoint")
+        if not self._cfg("reranker_enabled", False) or not endpoint or not results:
+            return results
+        pool = results[:40]
+        try:
+            headers = {"Content-Type": "application/json"}
+            api_key = self._cfg("reranker_api_key")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            response = requests.post(endpoint, json={
+                "model": self._cfg("reranker_model") or "rerank", "query": query,
+                "documents": [str(row.get("content") or "")[:2000] for row in pool],
+            }, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            scores = {}
+            if isinstance(data.get("results"), list):
+                for item in data["results"]:
+                    idx = item.get("index")
+                    value = item.get("relevance_score", item.get("score"))
+                    if (isinstance(idx, bool) or not isinstance(idx, int) or idx not in range(len(pool))
+                            or idx in scores or not isinstance(value, (int, float)) or not math.isfinite(value)):
+                        raise ValueError("invalid reranker results")
+                    scores[idx] = float(value)
+            elif isinstance(data.get("scores"), list):
+                for idx, value in enumerate(data["scores"]):
+                    if not isinstance(value, (int, float)) or not math.isfinite(value):
+                        raise ValueError("invalid reranker score")
+                    scores[idx] = float(value)
+            if set(scores) != set(range(len(pool))):
+                raise ValueError("incomplete reranker scores")
+            order = sorted(range(len(pool)), key=lambda idx: (-scores[idx], idx))
+            ranked = [dict(pool[idx], rerank_score=scores[idx]) for idx in order]
+            return ranked + results[len(pool):]
+        except Exception as exc:
+            logger.warning("Memory-search reranker failed; retaining fused order: %s", exc)
+            return results
+
     def _rerank(self, query: str, candidates: List[RetrievalCandidate]) -> List[RetrievalCandidate]:
         """Optional second-stage reranker.
 
