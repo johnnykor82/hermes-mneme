@@ -24,7 +24,7 @@ All plugin settings can be set via environment variables prefixed with `HERMES_C
 | `HERMES_CTX_PROTECTED_TAIL_TURNS` | Requested number of recent protected turns | `64` | Integer |
 | `HERMES_CTX_STATE_BUDGET_RATIO` | Budget ratio for execution state | `0.05` | Float |
 | `HERMES_CTX_RETRIEVED_BUDGET_RATIO` | Budget ratio for retrieved context | `0.30` | Float |
-| `HERMES_CTX_TOKEN_COUNTER` | Token counter method (`tiktoken`, `huggingface`, `chars`) | `tiktoken` | String |
+| `HERMES_CTX_TOKEN_COUNTER` | Declared setting; the current prompt builder uses tiktoken | `tiktoken` | String |
 | `HERMES_CTX_TOKENIZER_MODEL` | Model name for tokenizer (e.g., `cl100k_base`) | `cl100k_base` | String |
 | `HERMES_CTX_EMBEDDING_PROVIDER` | Provider type (`jina_compatible`, `ollama`, `openai_compatible`) | `jina_compatible` | String |
 | `HERMES_CTX_EMBEDDING_MODEL` | Embedding model name | `jina-embeddings-v5-text-small-retrieval-mlx` | String |
@@ -34,7 +34,7 @@ All plugin settings can be set via environment variables prefixed with `HERMES_C
 | `HERMES_CTX_SEGMENTATION_ENABLED` | Enable session segmenter | `true` | Boolean |
 | `HERMES_CTX_DRIFT_THRESHOLD` | Normalized embedding drift threshold for topic boundaries | `0.35` | Float |
 | `HERMES_CTX_LLM_ENRICHMENT_ENABLED` | Enable LLM enrichment of state | `true` | Boolean |
-| `HERMES_CTX_DELTA_EXTRACTION_ENABLED` | Enable delta extraction on continuation | `false` | Boolean |
+| `HERMES_CTX_DELTA_EXTRACTION_ENABLED` | Reserved setting; no delta extractor is activated | `false` | Boolean |
 | `HERMES_CTX_TOOL_OUTPUT_COMPRESS_THRESHOLD_TOKENS` | Token threshold to summarize tool outputs | `500` | Integer |
 | `HERMES_CTX_TOOL_OUTPUT_SUMMARY_TOKENS` | Max tokens for tool output summaries | `100` | Integer |
 | `HERMES_CTX_REINDEX_ON_MODEL_CHANGE` | Reindex all events on model change | `false` | Boolean |
